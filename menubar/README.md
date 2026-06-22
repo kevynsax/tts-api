@@ -2,7 +2,7 @@
 
 A tiny macOS menu-bar app that runs the native MLX TTS server (`../server.py`)
 and lets you start/stop it from the menu bar. It binds `0.0.0.0:8000` so the
-k8s reverse proxy (`chatterbox-tts.kevyn.com.br` → this machine) can reach it.
+k8s reverse proxy (`tts-macbook.kevyn.com.br` → this machine) can reach it.
 
 ## Build
 

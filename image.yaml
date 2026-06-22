@@ -1,4 +1,4 @@
-# Image coordinates for CI/CD discovery. Keep `version` in sync with ./VERSION.
+# Image coordinates for CI/CD discovery. Keep `version` in sync with ./version.txt.
 name: tts-server
 registry: registry.kevyn.com.br
 repository: ai-features/tts-server

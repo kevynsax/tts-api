@@ -4,7 +4,7 @@ Local, OpenAI-compatible text-to-speech using [Chatterbox](https://github.com/re
 running on Apple Silicon via MLX. Two ways to run it:
 
 - **Web server** (`server.py`) — an HTTP service speaking OpenAI's audio API,
-  served at `chatterbox-tts.kevyn.com.br` through a k8s reverse proxy.
+  served at `tts-macbook.kevyn.com.br` through a k8s reverse proxy.
 - **Menu-bar app** (`menubar/`) — a macOS taskbar app that starts/stops the
   server and launches it at login.
 
@@ -158,27 +158,38 @@ native server on the laptop and exposes it through the cluster:
 1. Run the server on the laptop bound to all interfaces — easiest via the
    menu-bar app (which sets `TTS_HOST=0.0.0.0`), or `TTS_HOST=0.0.0.0 ./run-server.sh`.
 2. The k8s manifests in `WebstormProjects/k8s/ai-features` reverse-proxy
-   `chatterbox-tts.kevyn.com.br` to this machine (`192.168.10.179:8000`) via a
+   `tts-macbook.kevyn.com.br` to this machine (`192.168.10.179:8000`) via a
    selector-less Service + Endpoints. The laptop is often offline; consumers
    probe `/openapi.json` to detect that.
 
-### Container / Kubernetes (x86_64, CPU or CUDA)
+### Container / Kubernetes (x86_64, GPU)
 
-For environments without Apple Silicon, `Dockerfile` builds a PyTorch variant
-(`server_cpu.py`) with the same HTTP API, serving the **Chatterbox** and
-**Kokoro** backends (runtime-switchable via `/v1/models/load`). It runs on CPU or
-CUDA and needs ≥6 GB RAM. OpenAudio/Fish is MLX-host-only and not in this image.
+`Dockerfile` builds a PyTorch variant (`server_cpu.py`) with the same HTTP API,
+serving the **Chatterbox** and **Kokoro** backends (runtime-switchable via
+`/v1/models/load`) plus a `/ready` endpoint for the k8s readiness probe. It
+defaults to CUDA torch (GPU) and is deployed in-cluster at `tts.kevyn.com.br`.
+OpenAudio/Fish is MLX-host-only and not in this image.
+
+The deployment manifests live in `WebstormProjects/k8s/ai-features`
+(`tts-server.yaml` + the shared `ingress.yaml`). Build & push the image:
 
 ```bash
-docker build --platform linux/amd64 -t <registry>/tts-server:latest .
-docker push <registry>/tts-server:latest
-docker run -d -p 8000:8000 -v tts-cache:/data/huggingface \
-  --memory 8g --cpus 4 <registry>/tts-server:latest
+# image coordinates are in ./image.yaml ; version in ./version.txt
+container build --platform linux/amd64 \
+  -t registry.kevyn.com.br/ai-features/tts-server:1.0.0 .
+container push registry.kevyn.com.br/ai-features/tts-server:1.0.0
 ```
 
-Kubernetes manifests (Deployment + Service + PVC for the HF cache + optional
-Ingress) and full build/deploy steps are in [`k8s/`](k8s/README.md). It adds a
-`/ready` endpoint (200 only once the model is loaded) for the readiness probe.
+For a CPU-only image: `--build-arg TORCH_INDEX=https://download.pytorch.org/whl/cpu`.
+
+**Build caching** (avoid reinstalling the multi-GB deps every build):
+
+- `Dockerfile` uses BuildKit `--mount=type=cache` for pip/apt, so wheels aren't
+  re-downloaded across builds; a persistent builder also reuses the whole layer.
+- For ephemeral CI runners, build the deps once into a base image with
+  `Dockerfile.base` (push as `tts-base`), then build per-commit with
+  `Dockerfile.app` (`--build-arg BASE_IMAGE=…/tts-base:1.0.0`) — code-only,
+  builds in seconds.
 
 ---
 
