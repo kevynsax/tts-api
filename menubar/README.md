@@ -1,4 +1,4 @@
-# Chatterbox TTS menu-bar app
+# TTS Server menu-bar app
 
 A tiny macOS menu-bar app that runs the native MLX TTS server (`../server.py`)
 and lets you start/stop it from the menu bar. It binds `0.0.0.0:8000` so the
@@ -10,13 +10,13 @@ k8s reverse proxy (`chatterbox-tts.kevyn.com.br` → this machine) can reach it.
 ./build.sh
 ```
 
-Produces `ChatterboxTTS.app`.
+Produces `TTSServer.app`.
 
 ## Install + run at login
 
 ```bash
-cp -r ChatterboxTTS.app /Applications/
-open /Applications/ChatterboxTTS.app
+cp -r TTSServer.app /Applications/
+open /Applications/TTSServer.app
 ```
 
 Then click the menu-bar icon and enable **Launch at Login**. (This registers the
@@ -27,7 +27,10 @@ Login Items.)
 
 - **Running / Starting… / Stopped** — live status (polls `/health`).
 - **Start / Stop / Restart** — control the server process.
+- **Model** — pick which MLX model to run (Chatterbox or OpenAudio/Fish);
+  switching restarts the server with the chosen model.
 - **Open Web UI** — opens `http://127.0.0.1:8000/docs`.
+- **Open Logs** — opens `~/Library/Logs/TTSServer/server.log`.
 - **Launch at Login** — toggle auto-start.
 - **Quit** — stops the server and exits.
 

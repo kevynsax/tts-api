@@ -9,3 +9,6 @@ samples/
 server.log
 .DS_Store
 menubar/ChatterboxTTS.app/
+menubar/TTSServer.app/
+menubar/AppIcon.icns
+menubar/AppIcon.iconset/

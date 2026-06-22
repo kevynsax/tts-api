@@ -3,13 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Chatterbox TTS</string>
+    <string>TTS Server</string>
     <key>CFBundleDisplayName</key>
-    <string>Chatterbox TTS</string>
+    <string>TTS Server</string>
     <key>CFBundleIdentifier</key>
-    <string>com.kevyn.chatterbox-tts</string>
+    <string>com.kevyn.tts-server</string>
     <key>CFBundleExecutable</key>
-    <string>ChatterboxTTS</string>
+    <string>TTSServer</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Base image: all heavy, slow-changing dependencies (system libs + PyTorch +
+# chatterbox-tts + kokoro + spaCy model). Build + push this ONCE; rebuild it only
+# when dependencies change. The app image (Dockerfile.app) then layers just the
+# code on top, so per-commit CI builds skip the multi-GB pip install entirely.
+#
+# Build & push (on an x86_64 builder):
+#   container build --platform linux/amd64 -t registry.kevyn.com.br/ai-features/tts-base:1.0.0 -f Dockerfile.base .
+#   container push registry.kevyn.com.br/ai-features/tts-base:1.0.0
+FROM python:3.11-slim
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg git espeak-ng
+
+WORKDIR /app
+
+# CUDA (cu124) torch by default for GPU nodes; for a CPU-only image build with:
+#   --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cpu
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --index-url ${TORCH_INDEX} torch==2.6.0 torchaudio==2.6.0
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+        chatterbox-tts \
+        kokoro "misaki[en]" \
+        soundfile fastapi "uvicorn[standard]" setproctitle
+
+RUN python -m spacy download en_core_web_sm || true

@@ -4,8 +4,15 @@ __pycache__/
 *.pyc
 *.wav
 *.mp3
+# keep reference voices (needed for Chatterbox cloning) despite *.mp3 above
+!voices/
+!voices/**
 server.log
 requirements*.txt
 README.md
 .gitignore
 samples/
+menubar/
+k8s/
+.git/
+*.icns

@@ -1,61 +1,154 @@
 #!/usr/bin/env python
 """
-Containerizable OpenAI-compatible Chatterbox TTS server (PyTorch).
+Containerizable OpenAI-compatible TTS server (PyTorch) for Linux / x86 / k8s.
 
-This mirrors server.py's HTTP API but uses the PyTorch `chatterbox-tts` package
-instead of MLX, because MLX needs Apple Silicon + Metal and cannot run inside a
-Linux container. It runs on CPU (or CUDA if available) — slower than the native
-MLX server, but portable. The native server.py remains the fast path on the host.
+Mirrors the native MLX server.py HTTP API, but uses PyTorch backends because MLX
+needs Apple Silicon + Metal and cannot run in a Linux container. Runs on CPU or
+CUDA (auto-detected). The native server.py remains the fast path on the Mac host.
 
-Same routes as server.py:
-    POST /v1/audio/speech   {model, input, voice, response_format, speed, language}
+Backends (selectable at runtime):
+    chatterbox  -> chatterbox-tts (PyTorch), clones from a reference clip
+    kokoro      -> kokoro (PyTorch), small/fast, named voices (e.g. af_heart)
+  (OpenAudio/Fish is MLX-host-only; fish-speech has no clean pip inference API.)
+
+Routes (same shape as server.py):
+    POST /v1/audio/speech    {model, input, voice, response_format, speed, language}
+    GET  /v1/models          list backends + which is active
+    POST /v1/models/load     hot-swap the active backend (returns immediately)
     GET  /v1/audio/voices
-    GET  /health
-    GET  /openapi.json, /docs   (FastAPI built-ins — used as the availability probe)
+    GET  /health             liveness + load state (loading|ready|error)
+    GET  /ready              200 only when the model is in memory (k8s readiness)
 
-Env: CHATTERBOX_TORCH_DEVICE (auto|cpu|cuda), TTS_HOST (0.0.0.0), TTS_PORT (8000).
+Env:
+    TTS_MODEL    default backend key ("chatterbox" | "kokoro")
+    TTS_DEVICE / CHATTERBOX_TORCH_DEVICE   auto | cpu | cuda
+    TTS_HOST (0.0.0.0), TTS_PORT (8000), TTS_API_KEY (optional bearer auth)
 """
 from __future__ import annotations
 
 import io
 import os
+import re
+import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+try:
+    from setproctitle import setproctitle
+    setproctitle("tts-server")
+except Exception:
+    pass
+
+KOKORO_REPO = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
+
+# Switchable backends. `key` is what clients pass; everything PyTorch-based here.
+MODEL_CATALOG = [
+    {"key": "chatterbox", "label": "Chatterbox", "backend": "chatterbox"},
+    {"key": "kokoro", "label": "Kokoro", "backend": "kokoro"},
+]
+KNOWN_KEYS = {m["key"] for m in MODEL_CATALOG}
+
+MODEL_KEY = os.environ.get("TTS_MODEL", "chatterbox").strip().lower()
+if MODEL_KEY not in KNOWN_KEYS:
+    MODEL_KEY = "chatterbox"
+
 VOICES_DIR = Path(__file__).parent / "voices"
-_lock = threading.Lock()
+API_KEY = os.environ.get("TTS_API_KEY")
+
+# Serialize all model work (load + generate) on one worker; also lets the load
+# run in the background so /health answers immediately with state="loading".
+_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
 _state: dict = {}
+
+_status_lock = threading.Lock()
+_status: dict = {"state": "loading", "model": MODEL_KEY, "error": None}
+
+
+def _set_status(**kw) -> None:
+    with _status_lock:
+        _status.update(kw)
+
+
+def get_status() -> dict:
+    with _status_lock:
+        return dict(_status)
 
 
 def pick_device() -> str:
-    pref = os.environ.get("CHATTERBOX_TORCH_DEVICE", "auto")
+    pref = (os.environ.get("TTS_DEVICE")
+            or os.environ.get("CHATTERBOX_TORCH_DEVICE", "auto")).lower()
     if pref != "auto":
         return pref
     import torch
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# ---- model loading ---------------------------------------------------------
+
+def _load_chatterbox(device: str) -> dict:
+    from chatterbox.tts import ChatterboxTTS
+    model = ChatterboxTTS.from_pretrained(device=device)
+    return {"backend": "chatterbox", "model": model, "sr": int(model.sr)}
+
+
+def _load_kokoro(device: str) -> dict:
+    from kokoro import KModel, KPipeline
+    kmodel = KModel(repo_id=KOKORO_REPO)
+    if device == "cuda":
+        kmodel = kmodel.to("cuda")
+    kmodel.eval()
+    # Pipelines are language-specific; cache one per language code, sharing weights.
+    pipes = {"a": KPipeline(lang_code="a", repo_id=KOKORO_REPO, model=kmodel)}
+    return {"backend": "kokoro", "kmodel": kmodel, "pipes": pipes, "sr": 24000}
+
+
+def _load_model_on_worker(model_key: str) -> None:
+    global MODEL_KEY
+    backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == model_key), None)
+    if backend is None:
+        _set_status(state="error", model=model_key, error=f"unknown model '{model_key}'")
+        return
+    _set_status(state="loading", model=model_key, error=None)
+    device = pick_device()
+    print(f"[server-cpu] loading {model_key} (backend={backend}) on {device} ...")
+    try:
+        loaded = _load_chatterbox(device) if backend == "chatterbox" else _load_kokoro(device)
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        print(f"[server-cpu] load FAILED for {model_key}: {msg}")
+        if _state.get("loaded"):
+            _set_status(state="ready", model=MODEL_KEY, error=msg)  # kept previous model
+        else:
+            _set_status(state="error", model=model_key, error=msg)
+        return
+    loaded["device"] = device
+    _state["loaded"] = loaded
+    MODEL_KEY = model_key
+    print(f"[server-cpu] ffmpeg: {FFMPEG or 'NOT FOUND'}")
+    print(f"[server-cpu] model ready: {model_key} on {device}")
+    _set_status(state="ready", model=model_key, error=None)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from chatterbox.tts import ChatterboxTTS
-    device = pick_device()
-    print(f"[server-cpu] loading Chatterbox on {device} ...")
-    _state["model"] = ChatterboxTTS.from_pretrained(device=device)
-    _state["sr"] = _state["model"].sr
-    print("[server-cpu] model ready")
+    import asyncio
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(_worker, _load_model_on_worker, MODEL_KEY)
     yield
     _state.clear()
+    _worker.shutdown(wait=False)
 
 
-app = FastAPI(title="Chatterbox OpenAI-compatible TTS (torch)", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="TTS Server (PyTorch, OpenAI-compatible)", version="1.0.0", lifespan=lifespan)
 
 
 class SpeechRequest(BaseModel):
@@ -64,16 +157,35 @@ class SpeechRequest(BaseModel):
     voice: str = "default"
     response_format: str = "mp3"
     speed: float = 1.0
-    language: str | None = None  # accepted for API parity (English model ignores it)
+    language: str | None = None
     exaggeration: float | None = None
     cfg_weight: float | None = None
 
+
+class LoadModelRequest(BaseModel):
+    model: str  # catalog key: "chatterbox" | "kokoro"
+
+
+# ---- audio helpers ---------------------------------------------------------
 
 _CONTENT_TYPES = {
     "wav": "audio/wav", "pcm": "audio/pcm", "mp3": "audio/mpeg",
     "flac": "audio/flac", "opus": "audio/ogg", "aac": "audio/aac",
 }
 _FFMPEG_FMT = {"mp3": "mp3", "flac": "flac", "opus": "opus", "aac": "adts"}
+
+
+def _find_ffmpeg() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for p in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+FFMPEG = _find_ffmpeg()
 
 
 def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
@@ -85,14 +197,18 @@ def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
 def encode_audio(samples: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
     fmt = fmt.lower()
     if fmt not in _CONTENT_TYPES:
-        raise HTTPException(400, f"Unsupported response_format '{fmt}'.")
+        raise HTTPException(400, f"Unsupported response_format '{fmt}'. "
+                                 f"Use one of {sorted(_CONTENT_TYPES)}.")
     if fmt == "wav":
         return _wav_bytes(samples, sr), _CONTENT_TYPES["wav"]
     if fmt == "pcm":
         return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes(), _CONTENT_TYPES["pcm"]
+    if not FFMPEG:
+        raise HTTPException(500, "ffmpeg not found; install it or request 'wav'/'pcm'.")
     wav = _wav_bytes(samples, sr)
     proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", _FFMPEG_FMT[fmt], "pipe:1"],
+        [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+         "-f", _FFMPEG_FMT[fmt], "pipe:1"],
         input=wav, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
@@ -113,33 +229,107 @@ def resolve_voice(voice: str) -> str | None:
 def list_voices() -> list[str]:
     voices = ["default"]
     if VOICES_DIR.exists():
-        voices += sorted({p.stem for p in VOICES_DIR.iterdir() if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
+        voices += sorted({p.stem for p in VOICES_DIR.iterdir()
+                          if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
     return voices
 
 
-@app.post("/v1/audio/speech")
-def create_speech(req: SpeechRequest):
-    model = _state.get("model")
-    if model is None:
-        raise HTTPException(503, "model not loaded yet")
+# ---- Kokoro helpers --------------------------------------------------------
+
+_KOKORO_LANG = {"en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f",
+                "hi": "h", "it": "i", "pt": "p", "pt-br": "p", "ja": "j", "zh": "z"}
+_KOKORO_VOICE_RE = re.compile(r"^[abefhijpz][fm]_")
+
+
+def _is_kokoro_voice(voice: str) -> bool:
+    return bool(voice) and bool(_KOKORO_VOICE_RE.match(voice))
+
+
+def _kokoro_pipeline(lang_letter: str):
+    from kokoro import KPipeline
+    loaded = _state["loaded"]
+    pipes = loaded["pipes"]
+    if lang_letter not in pipes:
+        pipes[lang_letter] = KPipeline(lang_code=lang_letter, repo_id=KOKORO_REPO,
+                                       model=loaded["kmodel"])
+    return pipes[lang_letter]
+
+
+def _to_numpy(audio) -> np.ndarray:
+    if hasattr(audio, "detach"):  # torch tensor
+        audio = audio.detach().cpu().numpy()
+    return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+# ---- synthesis -------------------------------------------------------------
+
+def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
+    st = get_status()
+    loaded = _state.get("loaded")
+    if loaded is None or st["state"] != "ready":
+        detail = (f"model is loading ({st['model']}); retry shortly"
+                  if st["state"] == "loading"
+                  else (st.get("error") or "model not loaded yet"))
+        raise HTTPException(503, detail)
     if not req.input.strip():
         raise HTTPException(400, "input is empty")
 
-    kwargs: dict = {}
-    ref = resolve_voice(req.voice)
-    if ref:
-        kwargs["audio_prompt_path"] = ref
-    if req.exaggeration is not None:
-        kwargs["exaggeration"] = req.exaggeration
-    if req.cfg_weight is not None:
-        kwargs["cfg_weight"] = req.cfg_weight
+    backend = loaded["backend"]
+    sr = loaded["sr"]
+    lang = (req.language or "").strip().lower()
+    lang_code = lang if lang and lang != "unknown" else "en"
 
-    with _lock:
-        wav = model.generate(req.input, **kwargs)
-    samples = np.asarray(wav, dtype=np.float32).reshape(-1)
-    sr = _state["sr"]
+    if backend == "kokoro":
+        voice_label = req.voice if _is_kokoro_voice(req.voice) else "af_heart"
+        pipe = _kokoro_pipeline(_KOKORO_LANG.get(lang_code, "a"))
+        chunks = [_to_numpy(audio) for _, _, audio in
+                  pipe(req.input, voice=voice_label, speed=req.speed)]
+        if not chunks:
+            raise HTTPException(500, "no audio produced")
+        samples = np.concatenate(chunks)
+    else:  # chatterbox
+        ref = resolve_voice(req.voice)
+        voice_label = req.voice if ref else "default"
+        kwargs: dict = {}
+        if ref:
+            kwargs["audio_prompt_path"] = ref
+        if req.exaggeration is not None:
+            kwargs["exaggeration"] = req.exaggeration
+        if req.cfg_weight is not None:
+            kwargs["cfg_weight"] = req.cfg_weight
+        wav = loaded["model"].generate(req.input, **kwargs)
+        samples = _to_numpy(wav)
+
+    preview = req.input.strip().replace("\n", " ")
+    if len(preview) > 60:
+        preview = preview[:57] + "..."
+    print(f"[speech] backend={backend} voice={voice_label} fmt={req.response_format} "
+          f"lang={lang_code} chars={len(req.input)} text={preview!r}")
+
     duration = len(samples) / sr
     audio, content_type = encode_audio(samples, sr, req.response_format)
+    return audio, content_type, duration
+
+
+def _check_auth(authorization: str | None) -> None:
+    if API_KEY and authorization != f"Bearer {API_KEY}":
+        raise HTTPException(401, "invalid api key")
+
+
+# ---- routes ----------------------------------------------------------------
+
+@app.post("/v1/audio/speech")
+async def create_speech(req: SpeechRequest, authorization: str | None = Header(default=None)):
+    import asyncio
+    _check_auth(authorization)
+    st = get_status()
+    if st["state"] != "ready" or "loaded" not in _state:
+        detail = (f"model is loading ({st['model']}); retry shortly"
+                  if st["state"] == "loading"
+                  else (st.get("error") or "model not loaded yet"))
+        raise HTTPException(503, detail)
+    loop = asyncio.get_running_loop()
+    audio, content_type, duration = await loop.run_in_executor(_worker, synthesize, req)
     return Response(
         content=audio,
         media_type=content_type,
@@ -150,21 +340,57 @@ def create_speech(req: SpeechRequest):
     )
 
 
+@app.get("/v1/models")
+def list_models():
+    st = get_status()
+    return {"object": "list", "active": st["model"], "state": st["state"], "data": [
+        {"id": m["key"], "label": m["label"], "backend": m["backend"],
+         "object": "model", "owned_by": "local", "active": st["model"] == m["key"]}
+        for m in MODEL_CATALOG
+    ]}
+
+
+@app.post("/v1/models/load")
+async def load_model_route(req: LoadModelRequest, authorization: str | None = Header(default=None)):
+    import asyncio
+    _check_auth(authorization)
+    key = (req.model or "").strip().lower()
+    if key not in KNOWN_KEYS:
+        raise HTTPException(400, f"unknown model '{req.model}'; choose from {sorted(KNOWN_KEYS)}")
+    st = get_status()
+    if st["state"] == "loading":
+        raise HTTPException(409, f"already loading {st['model']}; retry when ready")
+    if st["state"] == "ready" and st["model"] == key:
+        return {"state": "ready", "model": key, "changed": False}
+    _set_status(state="loading", model=key, error=None)
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(_worker, _load_model_on_worker, key)
+    return {"state": "loading", "model": key, "changed": True}
+
+
 @app.get("/v1/audio/voices")
 def voices():
     return {"voices": list_voices()}
 
 
-@app.get("/v1/models")
-def models():
-    return {"object": "list", "data": [{"id": "chatterbox", "object": "model", "owned_by": "local"}]}
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "loaded": "model" in _state}
+    st = get_status()
+    return {"status": "ok", "state": st["state"], "model": st["model"],
+            "loaded": st["state"] == "ready" and "loaded" in _state,
+            "error": st["error"]}
+
+
+@app.get("/ready")
+def ready():
+    """200 only when a model is in memory — use for the k8s readiness probe."""
+    st = get_status()
+    if st["state"] == "ready" and "loaded" in _state:
+        return {"status": "ready", "model": st["model"]}
+    raise HTTPException(503, f"not ready (state={st['state']})")
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=os.environ.get("TTS_HOST", "0.0.0.0"), port=int(os.environ.get("TTS_PORT", "8000")))
+    uvicorn.run(app, host=os.environ.get("TTS_HOST", "0.0.0.0"),
+                port=int(os.environ.get("TTS_PORT", "8000")))

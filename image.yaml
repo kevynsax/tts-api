@@ -1,0 +1,9 @@
+# Image coordinates for CI/CD discovery. Keep `version` in sync with ./VERSION.
+name: tts-server
+registry: registry.kevyn.com.br
+repository: ai-features/tts-server
+version: 1.0.0
+image: registry.kevyn.com.br/ai-features/tts-server:1.0.0
+platform: linux/amd64
+dockerfile: Dockerfile
+context: .

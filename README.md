@@ -51,7 +51,8 @@ Environment:
 |-----|---------|---------|
 | `TTS_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` to expose) |
 | `TTS_PORT` | `8000` | Port |
-| `CHATTERBOX_MODEL` | `mlx-community/chatterbox-fp16` | MLX model id |
+| `TTS_MODEL` | _(unset)_ | MLX model id; overrides `CHATTERBOX_MODEL`. Use `mlx-community/fish-audio-s2-pro-bf16` for OpenAudio/Fish |
+| `CHATTERBOX_MODEL` | `mlx-community/chatterbox-fp16` | MLX model id (fallback) |
 | `TTS_API_KEY` | _(unset)_ | If set, clients must send `Authorization: Bearer <key>` |
 
 ### Endpoints
@@ -59,8 +60,10 @@ Environment:
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/v1/audio/speech` | Generate audio (OpenAI-compatible) |
+| GET | `/v1/models` | List switchable models + which is active |
+| POST | `/v1/models/load` | Switch the active model (hot-swap, no restart) |
 | GET | `/v1/audio/voices` | List voices (built-in + clones) |
-| GET | `/health` | Liveness + model load state |
+| GET | `/health` | Liveness + load state (`loading`/`ready`/`error`) |
 | GET | `/openapi.json`, `/docs` | OpenAPI / Swagger (used as the availability probe) |
 
 ```bash
@@ -70,15 +73,50 @@ curl -X POST http://127.0.0.1:8000/v1/audio/speech \
   -o out.mp3
 ```
 
+The server loads the model in the background, so it answers `/health` immediately
+with `{"state":"loading"}` and flips to `"ready"` once the model is in memory.
+Speech requests return `503` while loading. Switch models at runtime:
+
+```bash
+# model = catalog key ("chatterbox", "openaudio") or a full MLX repo id
+curl -X POST http://127.0.0.1:8000/v1/models/load \
+  -H "Content-Type: application/json" -d '{"model":"openaudio"}'
+# then poll until ready
+curl -s http://127.0.0.1:8000/health
+```
+
+A failed switch (e.g. bad repo) keeps the previously loaded model serving and
+reports the reason in `/health`'s `error` field.
+
 Request fields: `input`, `voice`, `language` (ISO 639-1, e.g. `pt`),
 `response_format` (`mp3` default, `wav`, `flac`, `opus`, `aac`, `pcm`), `speed`,
-and optional `exaggeration` / `cfg_weight` / `temperature`. The response carries
-an `X-Audio-Duration-Seconds` header.
+optional `exaggeration` / `cfg_weight` / `temperature`, and `ref_text` (Fish
+cloning transcript). The response carries an `X-Audio-Duration-Seconds` header.
+
+### Models
+
+Three backends are supported and selectable from the menu-bar **Model** submenu,
+the `POST /v1/models/load` endpoint, or `TTS_MODEL`:
+
+- **Chatterbox** (`mlx-community/chatterbox-fp16`) — default; multilingual, clones
+  from a reference clip alone.
+- **OpenAudio / Fish S2 Pro** (`mlx-community/fish-audio-s2-pro-bf16`) — cloning
+  requires the reference clip's transcript (see below).
+- **Kokoro** (`mlx-community/Kokoro-82M-bf16`) — small/fast; no cloning. Uses named
+  voices (e.g. `af_heart` default, `am_michael`, `bf_emma`) passed in the `voice`
+  field; `language` is mapped to Kokoro's codes (en→a, en-gb→b, pt→p, es→e, fr→f,
+  hi→h, it→i, ja→j, zh→z). Needs the `misaki` G2P dependency (in `requirements-mlx.txt`).
 
 ### Voices / cloning
 
 Drop a reference clip at `voices/<name>.mp3` (or `.wav/.flac/.m4a`) and request
 `"voice": "<name>"`. `"default"` or unknown names use the built-in voice.
+
+**OpenAudio/Fish cloning** additionally needs the transcript of the reference
+clip. Provide it either per-request via the `ref_text` field, or as a sidecar
+file `voices/<name>.txt` containing exactly what the clip says. Without a
+transcript, Fish falls back to its built-in voice (and logs a note). Chatterbox
+ignores `ref_text` and clones from the clip alone.
 
 ---
 
@@ -124,15 +162,23 @@ native server on the laptop and exposes it through the cluster:
    selector-less Service + Endpoints. The laptop is often offline; consumers
    probe `/openapi.json` to detect that.
 
-### Container (portable, CPU only)
+### Container / Kubernetes (x86_64, CPU or CUDA)
 
-For environments without Apple Silicon, `Dockerfile` builds a PyTorch CPU
-variant (`server_cpu.py`) with the same API. It's slower and needs ≥6 GB RAM.
+For environments without Apple Silicon, `Dockerfile` builds a PyTorch variant
+(`server_cpu.py`) with the same HTTP API, serving the **Chatterbox** and
+**Kokoro** backends (runtime-switchable via `/v1/models/load`). It runs on CPU or
+CUDA and needs ≥6 GB RAM. OpenAudio/Fish is MLX-host-only and not in this image.
 
 ```bash
-container build -t chatterbox-tts .
-container run -d --name chatterbox-tts --memory 6g --cpus 4 chatterbox-tts
+docker build --platform linux/amd64 -t <registry>/tts-server:latest .
+docker push <registry>/tts-server:latest
+docker run -d -p 8000:8000 -v tts-cache:/data/huggingface \
+  --memory 8g --cpus 4 <registry>/tts-server:latest
 ```
+
+Kubernetes manifests (Deployment + Service + PVC for the HF cache + optional
+Ingress) and full build/deploy steps are in [`k8s/`](k8s/README.md). It adds a
+`/ready` endpoint (200 only once the model is loaded) for the readiness probe.
 
 ---
 
