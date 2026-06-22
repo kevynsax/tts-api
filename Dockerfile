@@ -3,8 +3,9 @@
 #
 # The native server.py uses MLX (Apple Silicon + Metal) and cannot run in a Linux
 # container, so this image runs the PyTorch path (server_cpu.py). It serves the
-# Chatterbox and Kokoro backends and runs on CPU or CUDA (auto-detected).
-# OpenAudio/Fish is MLX-host-only and is not included here.
+# Chatterbox, Kokoro, and Orpheus backends and runs on CPU or CUDA (auto-detected;
+# Orpheus is a 3B LLM and wants a GPU). OpenAudio/Fish is MLX-host-only and is not
+# included here.
 #
 # Build (on an x86_64 builder, or with buildx for cross-build):
 #   docker build --platform linux/amd64 -t <registry>/tts-server:latest .
@@ -44,6 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
         chatterbox-tts \
         kokoro "misaki[en]" \
+        snac \
         soundfile fastapi "uvicorn[standard]" setproctitle
 
 # Pre-download the spaCy English model misaki uses (avoids a first-request stall).

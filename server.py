@@ -84,6 +84,7 @@ MODEL_CATALOG = [
     {"key": "chatterbox", "label": "Chatterbox", "repo": "mlx-community/chatterbox-fp16"},
     {"key": "openaudio", "label": "OpenAudio (Fish S2 Pro)", "repo": "mlx-community/fish-audio-s2-pro-bf16"},
     {"key": "kokoro", "label": "Kokoro", "repo": "mlx-community/Kokoro-82M-bf16"},
+    {"key": "orpheus", "label": "Orpheus", "repo": "mlx-community/orpheus-3b-0.1-ft-4bit"},
 ]
 KNOWN_MODELS = {m["key"]: m["repo"] for m in MODEL_CATALOG}
 
@@ -101,16 +102,23 @@ def _is_kokoro(model_id: str) -> bool:
     return "kokoro" in model_id.lower()
 
 
+def _is_orpheus(model_id: str) -> bool:
+    return "orpheus" in model_id.lower()
+
+
 def _backend(model_id: str) -> str:
     if _is_kokoro(model_id):
         return "kokoro"
     if _is_fish(model_id):
         return "fish"
+    if _is_orpheus(model_id):
+        return "orpheus"
     return "chatterbox"
 
 
 IS_FISH = _is_fish(MODEL_ID)
 IS_KOKORO = _is_kokoro(MODEL_ID)
+IS_ORPHEUS = _is_orpheus(MODEL_ID)
 VOICES_DIR = Path(__file__).parent / "voices"
 API_KEY = os.environ.get("TTS_API_KEY")
 
@@ -172,7 +180,7 @@ def _patch_kokoro_vocoder() -> None:
 
 
 def _load_model_on_worker(model_id: str) -> None:
-    global MODEL_ID, IS_FISH, IS_KOKORO
+    global MODEL_ID, IS_FISH, IS_KOKORO, IS_ORPHEUS
     from mlx_audio.tts.utils import load_model
     backend = _backend(model_id)
     if backend == "kokoro":
@@ -193,6 +201,7 @@ def _load_model_on_worker(model_id: str) -> None:
     MODEL_ID = model_id
     IS_FISH = _is_fish(model_id)
     IS_KOKORO = _is_kokoro(model_id)
+    IS_ORPHEUS = _is_orpheus(model_id)
     try:
         import mlx.core as mx
         mx.clear_cache()
@@ -324,6 +333,52 @@ def _is_kokoro_voice(voice: str) -> bool:
     return bool(voice) and bool(_KOKORO_VOICE_RE.match(voice))
 
 
+# Orpheus ships eight named English voices; "tara" (first) is the default.
+_ORPHEUS_VOICES = ("tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe")
+
+
+def _is_orpheus_voice(voice: str) -> bool:
+    return bool(voice) and voice.lower() in _ORPHEUS_VOICES
+
+
+def _clone_voices() -> list[str]:
+    """Reference clips in voices/ usable by the cloning backends."""
+    if not VOICES_DIR.exists():
+        return []
+    return sorted({p.stem for p in VOICES_DIR.iterdir()
+                   if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
+
+
+_kokoro_voices_cache: dict[str, list[str]] = {}
+
+
+def _kokoro_voices(repo: str) -> list[str]:
+    """Named voices a Kokoro repo ships, from its voices/*.safetensors (cached)."""
+    if repo not in _kokoro_voices_cache:
+        try:
+            from huggingface_hub import list_repo_files
+            _kokoro_voices_cache[repo] = sorted(
+                f[len("voices/"):-len(".safetensors")]
+                for f in list_repo_files(repo)
+                if f.startswith("voices/") and f.endswith(".safetensors"))
+        except Exception:
+            _kokoro_voices_cache[repo] = []
+    return _kokoro_voices_cache[repo]
+
+
+def _voices_for(model_id: str) -> dict:
+    """Voices the given model accepts, plus whether it supports cloning."""
+    backend = _backend(model_id)
+    clones = _clone_voices()
+    if backend == "kokoro":
+        return {"backend": backend, "cloning": False,
+                "voices": _kokoro_voices(model_id) or ["af_heart"]}
+    if backend == "orpheus":
+        return {"backend": backend, "cloning": True,
+                "voices": list(_ORPHEUS_VOICES) + clones}
+    return {"backend": backend, "cloning": True, "voices": ["default"] + clones}
+
+
 def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     st = get_status()
     model = _state.get("model")
@@ -367,6 +422,23 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
                       f"Using default voice.")
+    elif IS_ORPHEUS:
+        # Orpheus: named voices (tara, leah, ...), no lang_code. Cloning is
+        # optional via a reference clip + its transcript; otherwise pick a named
+        # voice, defaulting to "tara".
+        kwargs.pop("speed", None)
+        voice_label = req.voice if _is_orpheus_voice(req.voice) else "tara"
+        kwargs["voice"] = voice_label
+        if ref_audio:
+            ref_text = req.ref_text or resolve_ref_text(req.voice)
+            if ref_text:
+                kwargs["ref_audio"] = ref_audio
+                kwargs["ref_text"] = ref_text
+                voice_label = req.voice
+            else:
+                print(f"[speech] note: no transcript for '{req.voice}'; add "
+                      f"voices/{req.voice}.txt or send ref_text to clone. "
+                      f"Using '{voice_label}'.")
     else:
         kwargs["lang_code"] = lang_code
         voice_label = req.voice if ref_audio else "default"
@@ -474,12 +546,11 @@ async def load_model_route(req: LoadModelRequest, authorization: str | None = He
 
 
 @app.get("/v1/audio/voices")
-def list_voices():
-    voices = ["default"]
-    if VOICES_DIR.exists():
-        voices += sorted({p.stem for p in VOICES_DIR.iterdir()
-                          if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
-    return {"voices": voices}
+def list_voices(model: str | None = None):
+    """Voices for a model. Defaults to the active model; pass ?model=<key|repo>
+    to preview another backend's voices without switching."""
+    model_id = _resolve_model_id(model) if model else MODEL_ID
+    return {"model": model_id, **_voices_for(model_id)}
 
 
 @app.get("/health")

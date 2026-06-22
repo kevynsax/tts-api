@@ -49,11 +49,16 @@ except Exception:
     pass
 
 KOKORO_REPO = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
+# Default to the ungated unsloth mirror so the container loads without an HF token;
+# canopylabs/orpheus-3b-0.1-ft is the gated upstream (set ORPHEUS_REPO + HF_TOKEN).
+ORPHEUS_REPO = os.environ.get("ORPHEUS_REPO", "unsloth/orpheus-3b-0.1-ft")
+ORPHEUS_SNAC_REPO = os.environ.get("ORPHEUS_SNAC_REPO", "hubertsiuzdak/snac_24khz")
 
 # Switchable backends. `key` is what clients pass; everything PyTorch-based here.
 MODEL_CATALOG = [
     {"key": "chatterbox", "label": "Chatterbox", "backend": "chatterbox"},
     {"key": "kokoro", "label": "Kokoro", "backend": "kokoro"},
+    {"key": "orpheus", "label": "Orpheus", "backend": "orpheus"},
 ]
 KNOWN_KEYS = {m["key"] for m in MODEL_CATALOG}
 
@@ -111,6 +116,23 @@ def _load_kokoro(device: str) -> dict:
     return {"backend": "kokoro", "kmodel": kmodel, "pipes": pipes, "sr": 24000}
 
 
+def _load_orpheus(device: str) -> dict:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from snac import SNAC
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(ORPHEUS_REPO, torch_dtype=dtype)
+    model.to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(ORPHEUS_REPO)
+    snac = SNAC.from_pretrained(ORPHEUS_SNAC_REPO).eval().to(device)
+    return {"backend": "orpheus", "model": model, "tokenizer": tokenizer,
+            "snac": snac, "sr": 24000}
+
+
+_BACKEND_LOADERS = {"chatterbox": _load_chatterbox, "kokoro": _load_kokoro,
+                    "orpheus": _load_orpheus}
+
+
 def _load_model_on_worker(model_key: str) -> None:
     global MODEL_KEY
     backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == model_key), None)
@@ -121,7 +143,7 @@ def _load_model_on_worker(model_key: str) -> None:
     device = pick_device()
     print(f"[server-cpu] loading {model_key} (backend={backend}) on {device} ...")
     try:
-        loaded = _load_chatterbox(device) if backend == "chatterbox" else _load_kokoro(device)
+        loaded = _BACKEND_LOADERS[backend](device)
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         print(f"[server-cpu] load FAILED for {model_key}: {msg}")
@@ -160,6 +182,7 @@ class SpeechRequest(BaseModel):
     language: str | None = None
     exaggeration: float | None = None
     cfg_weight: float | None = None
+    temperature: float | None = None  # Orpheus sampling temperature
 
 
 class LoadModelRequest(BaseModel):
@@ -226,12 +249,37 @@ def resolve_voice(voice: str) -> str | None:
     return None
 
 
-def list_voices() -> list[str]:
-    voices = ["default"]
-    if VOICES_DIR.exists():
-        voices += sorted({p.stem for p in VOICES_DIR.iterdir()
-                          if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
-    return voices
+def _clone_voices() -> list[str]:
+    if not VOICES_DIR.exists():
+        return []
+    return sorted({p.stem for p in VOICES_DIR.iterdir()
+                   if p.suffix in (".wav", ".mp3", ".flac", ".m4a")})
+
+
+_kokoro_voices_cache: dict[str, list[str]] = {}
+
+
+def _kokoro_repo_voices() -> list[str]:
+    if KOKORO_REPO not in _kokoro_voices_cache:
+        try:
+            from huggingface_hub import list_repo_files
+            _kokoro_voices_cache[KOKORO_REPO] = sorted(
+                f[len("voices/"):-len(".safetensors")]
+                for f in list_repo_files(KOKORO_REPO)
+                if f.startswith("voices/") and f.endswith(".safetensors"))
+        except Exception:
+            _kokoro_voices_cache[KOKORO_REPO] = []
+    return _kokoro_voices_cache[KOKORO_REPO]
+
+
+def _voices_for(key: str) -> dict:
+    backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == key), "chatterbox")
+    if backend == "kokoro":
+        return {"backend": backend, "cloning": False,
+                "voices": _kokoro_repo_voices() or ["af_heart"]}
+    if backend == "orpheus":  # named voices only; cloning is unreliable on Orpheus
+        return {"backend": backend, "cloning": False, "voices": list(_ORPHEUS_VOICES)}
+    return {"backend": backend, "cloning": True, "voices": ["default"] + _clone_voices()}
 
 
 # ---- Kokoro helpers --------------------------------------------------------
@@ -257,8 +305,70 @@ def _kokoro_pipeline(lang_letter: str):
 
 def _to_numpy(audio) -> np.ndarray:
     if hasattr(audio, "detach"):  # torch tensor
-        audio = audio.detach().cpu().numpy()
+        audio = audio.detach().cpu().float().numpy()
     return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+# ---- Orpheus helpers -------------------------------------------------------
+
+# Orpheus ships eight named English voices; "tara" (first) is the default.
+_ORPHEUS_VOICES = ("tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe")
+# Special tokens in the Orpheus prompt/codebook layout.
+_ORPHEUS_SOH, _ORPHEUS_EOT, _ORPHEUS_EOH = 128259, 128009, 128260  # start human, end text, end human
+_ORPHEUS_SOA, _ORPHEUS_EOA = 128257, 128258  # start / end of audio
+_ORPHEUS_CODE_OFFSET = 128266               # first audio-code token id
+_ORPHEUS_CODEBOOK = 4096                    # SNAC codebook size per slot
+
+
+def _is_orpheus_voice(voice: str) -> bool:
+    return bool(voice) and voice.lower() in _ORPHEUS_VOICES
+
+
+def _orpheus_generate_codes(loaded: dict, text: str, voice: str, temperature: float) -> list[int]:
+    """Run the Orpheus LM and return the flat list of SNAC code ids (offset removed)."""
+    import torch
+    model, tok, device = loaded["model"], loaded["tokenizer"], loaded["device"]
+    prompt_ids = tok(f"{voice}: {text}", return_tensors="pt").input_ids
+    start = torch.tensor([[_ORPHEUS_SOH]], dtype=torch.int64)
+    end = torch.tensor([[_ORPHEUS_EOT, _ORPHEUS_EOH]], dtype=torch.int64)
+    ids = torch.cat([start, prompt_ids, end], dim=1).to(device)
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=ids, attention_mask=torch.ones_like(ids),
+            max_new_tokens=1200, do_sample=True, temperature=max(temperature, 1e-4),
+            top_p=0.8, repetition_penalty=1.3, eos_token_id=_ORPHEUS_EOA,
+        )
+    gen = out[0, ids.shape[1]:].tolist()
+    # Crop to audio tokens (after the last start-of-audio), drop end markers,
+    # trim to a whole number of 7-token frames, and undo the code offset.
+    if _ORPHEUS_SOA in gen:
+        gen = gen[len(gen) - 1 - gen[::-1].index(_ORPHEUS_SOA) + 1:]
+    gen = [t for t in gen if t != _ORPHEUS_EOA]
+    gen = gen[: (len(gen) // 7) * 7]
+    return [t - _ORPHEUS_CODE_OFFSET for t in gen]
+
+
+def _orpheus_decode(loaded: dict, codes: list[int]) -> np.ndarray:
+    """Redistribute a flat code list into SNAC's 3 layers and decode to audio."""
+    import torch
+    cb = _ORPHEUS_CODEBOOK
+    l1, l2, l3 = [], [], []
+    for i in range(len(codes) // 7):
+        f = codes[7 * i:7 * i + 7]
+        l1.append(f[0])
+        l2.append(f[1] - cb)
+        l3.append(f[2] - 2 * cb)
+        l3.append(f[3] - 3 * cb)
+        l2.append(f[4] - 4 * cb)
+        l3.append(f[5] - 5 * cb)
+        l3.append(f[6] - 6 * cb)
+    dev = loaded["device"]
+    # Clamp to valid codebook range so a stray token can't crash the SNAC decoder.
+    layers = [torch.tensor(l, dtype=torch.int64, device=dev).clamp_(0, cb - 1).unsqueeze(0)
+              for l in (l1, l2, l3)]
+    with torch.no_grad():
+        audio = loaded["snac"].decode(layers)
+    return _to_numpy(audio)
 
 
 # ---- synthesis -------------------------------------------------------------
@@ -287,6 +397,13 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
         if not chunks:
             raise HTTPException(500, "no audio produced")
         samples = np.concatenate(chunks)
+    elif backend == "orpheus":
+        voice_label = req.voice if _is_orpheus_voice(req.voice) else "tara"
+        temp = req.temperature if req.temperature is not None else 0.6
+        codes = _orpheus_generate_codes(loaded, req.input, voice_label, temp)
+        if len(codes) < 7:
+            raise HTTPException(500, "no audio produced")
+        samples = _orpheus_decode(loaded, codes)
     else:  # chatterbox
         ref = resolve_voice(req.voice)
         voice_label = req.voice if ref else "default"
@@ -369,8 +486,13 @@ async def load_model_route(req: LoadModelRequest, authorization: str | None = He
 
 
 @app.get("/v1/audio/voices")
-def voices():
-    return {"voices": list_voices()}
+def voices(model: str | None = None):
+    """Voices for a model. Defaults to the active model; pass ?model=<key> to
+    preview another backend's voices without switching."""
+    key = (model or get_status()["model"] or "chatterbox").strip().lower()
+    if key not in KNOWN_KEYS:
+        key = "chatterbox"
+    return {"model": key, **_voices_for(key)}
 
 
 @app.get("/health")

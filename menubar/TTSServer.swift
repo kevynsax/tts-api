@@ -14,6 +14,7 @@ let availableModels: [TTSModel] = [
     TTSModel(label: "Chatterbox", repo: "mlx-community/chatterbox-fp16"),
     TTSModel(label: "OpenAudio (Fish S2 Pro)", repo: "mlx-community/fish-audio-s2-pro-bf16"),
     TTSModel(label: "Kokoro", repo: "mlx-community/Kokoro-82M-bf16"),
+    TTSModel(label: "Orpheus", repo: "mlx-community/orpheus-3b-0.1-ft-4bit"),
 ]
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

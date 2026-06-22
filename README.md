@@ -95,7 +95,7 @@ cloning transcript). The response carries an `X-Audio-Duration-Seconds` header.
 
 ### Models
 
-Three backends are supported and selectable from the menu-bar **Model** submenu,
+Four backends are supported and selectable from the menu-bar **Model** submenu,
 the `POST /v1/models/load` endpoint, or `TTS_MODEL`:
 
 - **Chatterbox** (`mlx-community/chatterbox-fp16`) — default; multilingual, clones
@@ -106,17 +106,27 @@ the `POST /v1/models/load` endpoint, or `TTS_MODEL`:
   voices (e.g. `af_heart` default, `am_michael`, `bf_emma`) passed in the `voice`
   field; `language` is mapped to Kokoro's codes (en→a, en-gb→b, pt→p, es→e, fr→f,
   hi→h, it→i, ja→j, zh→z). Needs the `misaki` G2P dependency (in `requirements-mlx.txt`).
+- **Orpheus** (`mlx-community/orpheus-3b-0.1-ft-4bit`) — English; eight named
+  voices (`tara` default, plus `leah`, `jess`, `leo`, `dan`, `mia`, `zac`, `zoe`)
+  passed in the `voice` field. Optional cloning from a reference clip + its
+  transcript (like Fish). Honors `temperature`; ignores `language`/`speed`.
+  Supports inline emotion tags such as `<laugh>`, `<sigh>`, `<gasp>` in the text.
 
 ### Voices / cloning
 
 Drop a reference clip at `voices/<name>.mp3` (or `.wav/.flac/.m4a`) and request
 `"voice": "<name>"`. `"default"` or unknown names use the built-in voice.
 
-**OpenAudio/Fish cloning** additionally needs the transcript of the reference
-clip. Provide it either per-request via the `ref_text` field, or as a sidecar
-file `voices/<name>.txt` containing exactly what the clip says. Without a
-transcript, Fish falls back to its built-in voice (and logs a note). Chatterbox
-ignores `ref_text` and clones from the clip alone.
+`GET /v1/audio/voices` is per-model: it returns the voices the active model
+accepts (Kokoro's 54 named voices, Orpheus's 8 named voices + your clone clips,
+or `default` + clone clips for Chatterbox/Fish) plus a `cloning` flag. Pass
+`?model=<key|repo>` to preview another backend's voices without switching.
+
+**OpenAudio/Fish and Orpheus cloning** additionally need the transcript of the
+reference clip. Provide it either per-request via the `ref_text` field, or as a
+sidecar file `voices/<name>.txt` containing exactly what the clip says. Without a
+transcript, Fish falls back to its built-in voice and Orpheus to a named voice
+(both log a note). Chatterbox ignores `ref_text` and clones from the clip alone.
 
 ---
 
@@ -165,16 +175,22 @@ native server on the laptop and exposes it through the cluster:
 ### Container / Kubernetes (x86_64, GPU)
 
 `Dockerfile` builds a PyTorch variant (`server_cpu.py`) with the same HTTP API,
-serving the **Chatterbox** and **Kokoro** backends (runtime-switchable via
-`/v1/models/load`) plus a `/ready` endpoint for the k8s readiness probe. It
+serving the **Chatterbox**, **Kokoro**, and **Orpheus** backends (runtime-switchable
+via `/v1/models/load`) plus a `/ready` endpoint for the k8s readiness probe. It
 defaults to CUDA torch (GPU) and is deployed in-cluster at `tts.kevyn.com.br`.
 OpenAudio/Fish is MLX-host-only and not in this image.
+
+Orpheus on the container is a 3B Llama LM (defaults to the ungated
+`unsloth/orpheus-3b-0.1-ft` mirror so it loads with no HF token; override with
+`ORPHEUS_REPO`, e.g. the gated `canopylabs/orpheus-3b-0.1-ft` + an `HF_TOKEN`) plus
+the SNAC codec; it needs a GPU node and ~6 GB of weights. It uses the eight named
+voices (no cloning here); `temperature` is honored.
 
 The deployment manifests live in `WebstormProjects/k8s/ai-features`
 (`tts-server.yaml` + the shared `ingress.yaml`). Build & push the image:
 
 ```bash
-# image coordinates are in ./image.yaml ; version in ./version.txt
+# version in ./version.txt
 container build --platform linux/amd64 \
   -t registry.kevyn.com.br/ai-features/tts-server:1.0.0 .
 container push registry.kevyn.com.br/ai-features/tts-server:1.0.0
