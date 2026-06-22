@@ -1,0 +1,11 @@
+.venv/
+.venv-mlx/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+!voices/*
+samples/
+server.log
+.DS_Store
+menubar/ChatterboxTTS.app/

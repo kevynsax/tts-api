@@ -1,0 +1,11 @@
+.venv/
+.venv-mlx/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+server.log
+requirements*.txt
+README.md
+.gitignore
+samples/
