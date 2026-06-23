@@ -19,9 +19,16 @@ Routes (same shape as server.py):
     GET  /health             liveness + load state (loading|ready|error)
     GET  /ready              200 only when the model is in memory (k8s readiness)
 
+Memory:
+    By default the model loads on the first request and unloads after idle, so the
+    GPU/CPU stays free for other work when the server isn't in use. The first
+    request after an idle period pays a cold-start reload.
+
 Env:
     TTS_MODEL    default backend key ("chatterbox" | "kokoro")
-    TTS_DEVICE / CHATTERBOX_TORCH_DEVICE   auto | cpu | cuda
+    TTS_DEVICE / CHATTERBOX_TORCH_DEVICE   auto | cpu | cuda | mps
+    TTS_IDLE_UNLOAD_SECONDS   unload after N idle seconds (default 300; 0 = never)
+    TTS_PRELOAD  "1" to load at startup instead of on first request
     TTS_HOST (0.0.0.0), TTS_PORT (8000), TTS_API_KEY (optional bearer auth)
 """
 from __future__ import annotations
@@ -32,6 +39,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -73,13 +81,25 @@ if MODEL_KEY not in KNOWN_KEYS:
 VOICES_DIR = Path(__file__).parent / "voices"
 API_KEY = os.environ.get("TTS_API_KEY")
 
-# Serialize all model work (load + generate) on one worker; also lets the load
-# run in the background so /health answers immediately with state="loading".
+# Keep the GPU/CPU free for other work: load on first request, then unload after
+# this many idle seconds (0 disables auto-unload). TTS_PRELOAD=1 loads at startup
+# instead of waiting for the first request.
+IDLE_UNLOAD_SECONDS = int(os.environ.get("TTS_IDLE_UNLOAD_SECONDS", "300"))
+PRELOAD = os.environ.get("TTS_PRELOAD", "0").strip().lower() in ("1", "true", "yes")
+
+# Serialize all model work (load + generate + unload) on one worker; also lets the
+# load run in the background so /health answers immediately with state="loading".
 _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
 _state: dict = {}
 
+# Wall-clock of the last request, so the idle monitor knows when to unload.
+_activity_lock = threading.Lock()
+_last_activity = 0.0
+_unload_pending = False
+
 _status_lock = threading.Lock()
-_status: dict = {"state": "loading", "model": MODEL_KEY, "error": None}
+# "idle" = nothing in memory but ready to load on demand; "loading"/"ready"/"error".
+_status: dict = {"state": "loading" if PRELOAD else "idle", "model": MODEL_KEY, "error": None}
 
 
 def _set_status(**kw) -> None:
@@ -90,6 +110,55 @@ def _set_status(**kw) -> None:
 def get_status() -> dict:
     with _status_lock:
         return dict(_status)
+
+
+def _touch() -> None:
+    global _last_activity
+    with _activity_lock:
+        _last_activity = time.monotonic()
+
+
+def _free_device_memory(device: str) -> None:
+    try:
+        import torch
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        elif device == "mps" and hasattr(torch, "mps"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _unload_on_worker() -> None:
+    """Drop the model and hand its GPU/CPU memory back. Runs on the worker thread,
+    so it can never overlap a generation."""
+    global _unload_pending
+    _unload_pending = False
+    loaded = _state.pop("loaded", None)
+    if loaded is None:
+        return
+    device = loaded.get("device", "cpu")
+    loaded.clear()
+    import gc
+    gc.collect()
+    _free_device_memory(device)
+    _set_status(state="idle", model=MODEL_KEY, error=None)
+    print(f"[server-cpu] unloaded {MODEL_KEY}; freed {device} memory")
+
+
+def _idle_monitor() -> None:
+    """Background loop: unload the model after IDLE_UNLOAD_SECONDS of inactivity."""
+    global _unload_pending
+    tick = max(5, min(IDLE_UNLOAD_SECONDS, 30))
+    while True:
+        time.sleep(tick)
+        if "loaded" not in _state or _unload_pending:
+            continue
+        with _activity_lock:
+            idle = time.monotonic() - _last_activity
+        if idle >= IDLE_UNLOAD_SECONDS:
+            _unload_pending = True
+            _worker.submit(_unload_on_worker)
 
 
 def pick_device() -> str:
@@ -163,6 +232,7 @@ def _load_model_on_worker(model_key: str) -> None:
     loaded["device"] = device
     _state["loaded"] = loaded
     MODEL_KEY = model_key
+    _touch()
     print(f"[server-cpu] ffmpeg: {FFMPEG or 'NOT FOUND'}")
     print(f"[server-cpu] model ready: {model_key} on {device}")
     _set_status(state="ready", model=model_key, error=None)
@@ -172,7 +242,15 @@ def _load_model_on_worker(model_key: str) -> None:
 async def lifespan(app: FastAPI):
     import asyncio
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(_worker, _load_model_on_worker, MODEL_KEY)
+    if PRELOAD:
+        loop.run_in_executor(_worker, _load_model_on_worker, MODEL_KEY)
+    else:
+        print(f"[server-cpu] lazy mode: '{MODEL_KEY}' loads on first request, "
+              f"unloads after {IDLE_UNLOAD_SECONDS}s idle"
+              if IDLE_UNLOAD_SECONDS else
+              f"[server-cpu] lazy mode: '{MODEL_KEY}' loads on first request")
+    if IDLE_UNLOAD_SECONDS > 0:
+        threading.Thread(target=_idle_monitor, name="idle-monitor", daemon=True).start()
     yield
     _state.clear()
     _worker.shutdown(wait=False)
@@ -440,6 +518,15 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     return audio, content_type, duration
 
 
+def _serve(req: SpeechRequest) -> tuple[bytes, str, float]:
+    """Worker-thread entry: load the active model if it was unloaded, then render."""
+    if "loaded" not in _state:
+        _load_model_on_worker(MODEL_KEY)
+        if "loaded" not in _state:
+            raise HTTPException(503, get_status().get("error") or "model failed to load")
+    return synthesize(req)
+
+
 def _check_auth(authorization: str | None) -> None:
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(401, "invalid api key")
@@ -452,13 +539,12 @@ async def create_speech(req: SpeechRequest, authorization: str | None = Header(d
     import asyncio
     _check_auth(authorization)
     st = get_status()
-    if st["state"] != "ready" or "loaded" not in _state:
-        detail = (f"model is loading ({st['model']}); retry shortly"
-                  if st["state"] == "loading"
-                  else (st.get("error") or "model not loaded yet"))
-        raise HTTPException(503, detail)
+    if st["state"] == "loading":
+        raise HTTPException(503, f"model is loading ({st['model']}); retry shortly")
+    _touch()
     loop = asyncio.get_running_loop()
-    audio, content_type, duration = await loop.run_in_executor(_worker, synthesize, req)
+    audio, content_type, duration = await loop.run_in_executor(_worker, _serve, req)
+    _touch()
     return Response(
         content=audio,
         media_type=content_type,
@@ -497,6 +583,18 @@ async def load_model_route(req: LoadModelRequest, authorization: str | None = He
     return {"state": "loading", "model": key, "changed": True}
 
 
+@app.post("/v1/models/unload")
+async def unload_model_route(authorization: str | None = Header(default=None)):
+    """Drop the model now and free GPU/CPU memory. It reloads on the next request."""
+    import asyncio
+    _check_auth(authorization)
+    if "loaded" not in _state:
+        return {"state": get_status()["state"], "unloaded": False}
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_worker, _unload_on_worker)
+    return {"state": "idle", "model": MODEL_KEY, "unloaded": True}
+
+
 @app.get("/v1/audio/voices")
 def voices(model: str | None = None):
     """Voices for a model. Defaults to the active model; pass ?model=<key> to
@@ -517,10 +615,12 @@ def health():
 
 @app.get("/ready")
 def ready():
-    """200 only when a model is in memory — use for the k8s readiness probe."""
+    """200 when the server can serve — either a model is in memory ("ready") or it
+    is unloaded but loads on demand ("idle"). Use for the k8s readiness probe."""
     st = get_status()
-    if st["state"] == "ready" and "loaded" in _state:
-        return {"status": "ready", "model": st["model"]}
+    if st["state"] in ("ready", "idle"):
+        return {"status": "ready", "model": st["model"],
+                "loaded": st["state"] == "ready"}
     raise HTTPException(503, f"not ready (state={st['state']})")
 
 
