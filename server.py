@@ -255,6 +255,9 @@ _CONTENT_TYPES = {
 }
 # ffmpeg muxer name per format
 _FFMPEG_FMT = {"mp3": "mp3", "flac": "flac", "opus": "opus", "aac": "adts"}
+# Explicit high bitrates so lossy codecs don't add their own shimmer on top of the
+# vocoder. flac is lossless and takes none. opus is efficient, so 96k is transparent.
+_FFMPEG_BITRATE = {"mp3": "256k", "aac": "256k", "opus": "96k"}
 
 
 def _find_ffmpeg() -> str | None:
@@ -291,9 +294,10 @@ def encode_audio(samples: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
         raise HTTPException(500, "ffmpeg not found; install it (brew install ffmpeg) "
                                  "or request response_format 'wav'/'pcm'.")
     wav = _wav_bytes(samples, sr)
+    bitrate = ["-b:a", _FFMPEG_BITRATE[fmt]] if fmt in _FFMPEG_BITRATE else []
     proc = subprocess.run(
         [FFMPEG, "-hide_banner", "-loglevel", "error",
-         "-i", "pipe:0", "-f", _FFMPEG_FMT[fmt], "pipe:1"],
+         "-i", "pipe:0", "-f", _FFMPEG_FMT[fmt], *bitrate, "pipe:1"],
         input=wav, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:

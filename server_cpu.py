@@ -36,6 +36,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+# Let unsupported ops on Apple's MPS backend (e.g. iSTFTNet's istft/complex math)
+# fall back to CPU instead of crashing. Harmless on non-Mac. Must be set before torch.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, Header, HTTPException
@@ -94,7 +98,11 @@ def pick_device() -> str:
     if pref != "auto":
         return pref
     import torch
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 # ---- model loading ---------------------------------------------------------
@@ -108,8 +116,8 @@ def _load_chatterbox(device: str) -> dict:
 def _load_kokoro(device: str) -> dict:
     from kokoro import KModel, KPipeline
     kmodel = KModel(repo_id=KOKORO_REPO)
-    if device == "cuda":
-        kmodel = kmodel.to("cuda")
+    if device in ("cuda", "mps"):
+        kmodel = kmodel.to(device)
     kmodel.eval()
     # Pipelines are language-specific; cache one per language code, sharing weights.
     pipes = {"a": KPipeline(lang_code="a", repo_id=KOKORO_REPO, model=kmodel)}
@@ -196,6 +204,9 @@ _CONTENT_TYPES = {
     "flac": "audio/flac", "opus": "audio/ogg", "aac": "audio/aac",
 }
 _FFMPEG_FMT = {"mp3": "mp3", "flac": "flac", "opus": "opus", "aac": "adts"}
+# High bitrates so lossy codecs don't add shimmer on top of the vocoder; flac is
+# lossless (none), opus is efficient so 96k is transparent.
+_FFMPEG_BITRATE = {"mp3": "256k", "aac": "256k", "opus": "96k"}
 
 
 def _find_ffmpeg() -> str | None:
@@ -229,9 +240,10 @@ def encode_audio(samples: np.ndarray, sr: int, fmt: str) -> tuple[bytes, str]:
     if not FFMPEG:
         raise HTTPException(500, "ffmpeg not found; install it or request 'wav'/'pcm'.")
     wav = _wav_bytes(samples, sr)
+    bitrate = ["-b:a", _FFMPEG_BITRATE[fmt]] if fmt in _FFMPEG_BITRATE else []
     proc = subprocess.run(
         [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
-         "-f", _FFMPEG_FMT[fmt], "pipe:1"],
+         "-f", _FFMPEG_FMT[fmt], *bitrate, "pipe:1"],
         input=wav, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
