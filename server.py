@@ -327,9 +327,6 @@ def resolve_ref_text(voice: str) -> str | None:
     return None
 
 
-# ISO 639-1 -> Kokoro single-letter language code. Unknown -> American English.
-_KOKORO_LANG = {"en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f",
-                "hi": "h", "it": "i", "pt": "p", "pt-br": "p", "ja": "j", "zh": "z"}
 _KOKORO_VOICE_RE = re.compile(r"^[abefhijpz][fm]_")
 
 
@@ -405,8 +402,8 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
         # Kokoro: named voices (e.g. "af_heart"), no cloning. Map ISO language to
         # Kokoro's single-letter code; unknown voices fall back to the default.
         kwargs.pop("temperature", None)
-        kwargs["lang_code"] = _KOKORO_LANG.get(lang_code, "a")
         voice_label = req.voice if _is_kokoro_voice(req.voice) else "af_heart"
+        kwargs["lang_code"] = voice_label[0]
         kwargs["voice"] = voice_label
         if ref_audio and not _is_kokoro_voice(req.voice):
             print(f"[speech] note: Kokoro has no cloning; '{req.voice}' is not a "

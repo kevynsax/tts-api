@@ -374,8 +374,6 @@ def _voices_for(key: str) -> dict:
 
 # ---- Kokoro helpers --------------------------------------------------------
 
-_KOKORO_LANG = {"en": "a", "en-us": "a", "en-gb": "b", "es": "e", "fr": "f",
-                "hi": "h", "it": "i", "pt": "p", "pt-br": "p", "ja": "j", "zh": "z"}
 _KOKORO_VOICE_RE = re.compile(r"^[abefhijpz][fm]_")
 
 
@@ -481,7 +479,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
 
     if backend == "kokoro":
         voice_label = req.voice if _is_kokoro_voice(req.voice) else "af_heart"
-        pipe = _kokoro_pipeline(_KOKORO_LANG.get(lang_code, "a"))
+        pipe = _kokoro_pipeline(voice_label[0])
         chunks = [_to_numpy(audio) for _, _, audio in
                   pipe(req.input, voice=voice_label, speed=req.speed)]
         if not chunks:
