@@ -69,12 +69,11 @@ KOKORO_REPO = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
 ORPHEUS_REPO = os.environ.get("ORPHEUS_REPO", "unsloth/orpheus-3b-0.1-ft")
 ORPHEUS_SNAC_REPO = os.environ.get("ORPHEUS_SNAC_REPO", "hubertsiuzdak/snac_24khz")
 
-# Higgs Audio v2 (PyTorch). The bf16 3B wants ~24 GB VRAM, so default to 4-bit
-# bitsandbytes (NF4) quantization (~5 GB; 8-bit ~7 GB; 0 = full bf16). Quantization
-# needs CUDA + bitsandbytes; on CPU it always loads full precision.
-HIGGS_REPO = os.environ.get("HIGGS_REPO", "bosonai/higgs-audio-v2-generation-3B-base")
-HIGGS_TOKENIZER_REPO = os.environ.get(
-    "HIGGS_TOKENIZER_REPO", "bosonai/higgs-audio-v2-tokenizer")
+# Higgs Audio v2 (PyTorch, native transformers >=5.3). The bf16 3B wants ~24 GB
+# VRAM, so default to 4-bit bitsandbytes (NF4) quantization (~5 GB; 8-bit ~7 GB;
+# 0 = full bf16). Quantization needs CUDA + bitsandbytes; on CPU it loads full
+# precision. The eustlb mirror ships the transformers processor + chat template.
+HIGGS_REPO = os.environ.get("HIGGS_REPO", "eustlb/higgs-audio-v2-generation-3B-base")
 HIGGS_QUANT_BITS = int(os.environ.get("HIGGS_QUANT_BITS", "4"))
 HIGGS_MAX_NEW_TOKENS = int(os.environ.get("HIGGS_MAX_NEW_TOKENS", "2048"))
 HIGGS_SCENE = os.environ.get("HIGGS_SCENE", "Audio is recorded from a quiet room.")
@@ -222,48 +221,32 @@ def _load_orpheus(device: str) -> dict:
 
 def _load_higgs(device: str) -> dict:
     import torch
-    from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+    from transformers import AutoProcessor
+    try:
+        from transformers import HiggsAudioV2ForConditionalGeneration as HiggsGen
+    except ImportError:  # older naming before the _v2 rename
+        from transformers import HiggsAudioForConditionalGeneration as HiggsGen
 
-    compute_dtype = torch.float16 if device == "cuda" else torch.float32
-    quantize = HIGGS_QUANT_BITS in (4, 8) and device == "cuda"
-
-    if quantize:
-        # Upstream's serve engine has no quantization flag and does
-        # `HiggsAudioModel.from_pretrained(...).to(device)`. Inject a
-        # BitsAndBytesConfig into that call for the duration of construction.
+    processor = AutoProcessor.from_pretrained(HIGGS_REPO)
+    kwargs: dict = {}
+    if HIGGS_QUANT_BITS in (4, 8) and device == "cuda":
         from transformers import BitsAndBytesConfig
-        from boson_multimodal.model.higgs_audio import HiggsAudioModel
         if HIGGS_QUANT_BITS == 4:
-            qconf = BitsAndBytesConfig(
+            kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
         else:
-            qconf = BitsAndBytesConfig(load_in_8bit=True)
-        _orig = HiggsAudioModel.from_pretrained
-
-        def _patched(*a, **kw):
-            kw.setdefault("quantization_config", qconf)
-            kw.setdefault("device_map", {"": device})
-            model = _orig(*a, **kw)
-            # The engine chains `.to(device)` after from_pretrained, which bnb-quantized
-            # models reject; they're already placed via device_map, so make it a no-op.
-            model.to = lambda *args, **kwargs: model
-            return model
-
-        HiggsAudioModel.from_pretrained = staticmethod(_patched)
-        try:
-            engine = HiggsAudioServeEngine(
-                HIGGS_REPO, HIGGS_TOKENIZER_REPO,
-                device=device, torch_dtype=compute_dtype)
-        finally:
-            HiggsAudioModel.from_pretrained = _orig
-        print(f"[server-cpu] Higgs loaded in {HIGGS_QUANT_BITS}-bit quantization")
+            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        kwargs["device_map"] = {"": device}
+        print(f"[server-cpu] Higgs loading in {HIGGS_QUANT_BITS}-bit quantization")
     else:
-        engine = HiggsAudioServeEngine(
-            HIGGS_REPO, HIGGS_TOKENIZER_REPO,
-            device=device, torch_dtype=compute_dtype)
+        kwargs["torch_dtype"] = torch.float16 if device == "cuda" else torch.float32
 
-    return {"backend": "higgs", "engine": engine, "sr": 24000}
+    model = HiggsGen.from_pretrained(HIGGS_REPO, **kwargs)
+    if "device_map" not in kwargs:
+        model = model.to(device)
+    model.eval()
+    return {"backend": "higgs", "model": model, "processor": processor, "sr": 24000}
 
 
 _BACKEND_LOADERS = {"chatterbox": _load_chatterbox, "kokoro": _load_kokoro,
@@ -413,33 +396,48 @@ def resolve_ref_text(voice: str) -> str | None:
 
 def _higgs_generate(loaded: dict, text: str, ref_audio: str | None,
                     ref_text: str | None, temperature: float | None):
-    """Render speech with Higgs Audio v2. With a reference clip + its transcript it
-    zero-shot clones the voice; otherwise it picks a smart-voice default."""
-    import base64
-    from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+    """Render speech with Higgs Audio v2 (native transformers). With a reference clip
+    + its transcript it zero-shot clones the voice; otherwise smart-voice default."""
+    import tempfile
 
-    engine = loaded["engine"]
-    system = ("Generate audio following instruction.\n\n"
-              f"<|scene_desc_start|>\n{HIGGS_SCENE}\n<|scene_desc_end|>")
-    messages = [Message(role="system", content=system)]
+    model = loaded["model"]
+    processor = loaded["processor"]
+    conversation = [
+        {"role": "system",
+         "content": [{"type": "text", "text": "Generate audio following instruction."}]},
+        {"role": "scene", "content": [{"type": "text", "text": HIGGS_SCENE}]},
+    ]
     if ref_audio and ref_text:
-        with open(ref_audio, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("ascii")
-        messages.append(Message(role="user", content=ref_text))
-        messages.append(Message(role="assistant",
-                                content=AudioContent(raw_audio=b64, audio_url="")))
-    messages.append(Message(role="user", content=text))
+        conversation.append({"role": "user", "content": [{"type": "text", "text": ref_text}]})
+        conversation.append({"role": "assistant",
+                             "content": [{"type": "audio", "url": ref_audio}]})
+    conversation.append({"role": "user", "content": [{"type": "text", "text": text}]})
 
-    out = engine.generate(
-        chat_ml_sample=ChatMLSample(messages=messages),
-        max_new_tokens=HIGGS_MAX_NEW_TOKENS,
-        temperature=temperature if temperature is not None else 0.3,
-        top_p=0.95, top_k=50,
-        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
-    )
-    if out.audio is None or len(out.audio) == 0:
+    inputs = processor.apply_chat_template(
+        conversation, add_generation_prompt=True, tokenize=True,
+        return_dict=True, sampling_rate=24000, return_tensors="pt",
+    ).to(model.device)
+
+    gen_kwargs: dict = {"max_new_tokens": HIGGS_MAX_NEW_TOKENS}
+    if temperature and temperature > 0:
+        gen_kwargs.update(do_sample=True, temperature=temperature, top_p=0.95)
+    else:
+        gen_kwargs["do_sample"] = False
+
+    import torch
+    with torch.no_grad():
+        outputs = model.generate(**inputs, **gen_kwargs)
+    decoded = processor.batch_decode(outputs)
+
+    # Let the processor reconstruct the waveform, then read it back as samples.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
+        processor.save_audio(decoded, tf.name)
+        samples, sr = sf.read(tf.name, dtype="float32")
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+    if samples.size == 0:
         raise HTTPException(500, "no audio produced")
-    return np.asarray(out.audio, dtype=np.float32), int(out.sampling_rate or loaded["sr"])
+    return np.asarray(samples, dtype=np.float32), int(sr)
 
 
 def _clone_voices() -> list[str]:

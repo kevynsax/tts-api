@@ -27,7 +27,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         chatterbox-tts \
         kokoro "misaki[en]" \
         snac \
-        boson-multimodal bitsandbytes accelerate \
+        bitsandbytes accelerate \
         soundfile fastapi "uvicorn[standard]" setproctitle
+
+# Higgs Audio v2 is native in transformers >=5.3 (docs target 5.12); upgrade after
+# the others install so a conflicting pin from chatterbox-tts/kokoro is visible here.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U "transformers>=5.3.0"
 
 RUN python -m spacy download en_core_web_sm || true

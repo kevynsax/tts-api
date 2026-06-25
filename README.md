@@ -180,11 +180,13 @@ serving the **Chatterbox**, **Kokoro**, **Orpheus**, and **Higgs Audio v2** back
 readiness probe. It defaults to CUDA torch (GPU) and is deployed in-cluster at
 `tts.kevyn.com.br`. OpenAudio/Fish is MLX-host-only and not in this image.
 
-Higgs Audio v2 on the container is the `bosonai/higgs-audio-v2-generation-3B-base`
-model + its audio tokenizer. The bf16 weights want ~24 GB VRAM, so the server loads
-it **4-bit quantized** (bitsandbytes NF4, ~5 GB) by default — set `HIGGS_QUANT_BITS=8`
-(~7 GB) or `0` (full bf16) to change. It supports optional voice cloning via a
-reference clip + transcript (`voices/<name>.wav` + `voices/<name>.txt`, or `ref_text`).
+Higgs Audio v2 on the container uses **native transformers support** (≥5.3) via
+`HiggsAudioV2ForConditionalGeneration`, loading `eustlb/higgs-audio-v2-generation-3B-base`
+(the mirror that ships the transformers processor + chat template). The bf16 weights
+want ~24 GB VRAM, so the server loads it **4-bit quantized** (bitsandbytes NF4, ~5 GB)
+by default — set `HIGGS_QUANT_BITS=8` (~7 GB) or `0` (full bf16) to change. It supports
+optional voice cloning via a reference clip + transcript (`voices/<name>.wav` +
+`voices/<name>.txt`, or `ref_text`).
 
 Orpheus on the container is a 3B Llama LM (defaults to the ungated
 `unsloth/orpheus-3b-0.1-ft` mirror so it loads with no HF token; override with
