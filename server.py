@@ -291,24 +291,25 @@ def _find_ffmpeg() -> str | None:
 FFMPEG = _find_ffmpeg()
 
 
-def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 30) -> np.ndarray:
+def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 80) -> np.ndarray:
     """Trim leading/trailing silence (and the ambient noise floor that lives in it).
 
-    Keeps everything above a peak-relative threshold (~-40 dB) plus a small absolute
-    floor, padded by pad_ms so consonant onsets/decays aren't clipped.
+    Keeps everything above a peak-relative threshold plus a small absolute floor,
+    padded generously by pad_ms so word onsets/decays are never clipped. Only the
+    head and tail are touched; pauses inside the sentence are left intact.
     """
     if samples.size == 0:
         return samples
-    # Smoothed RMS envelope over ~20 ms so isolated spikes (residual spectral-gate
+    # Smoothed RMS envelope over ~30 ms so isolated spikes (residual spectral-gate
     # noise) don't count as speech and keep the silence from being trimmed.
-    win = max(1, int(sr * 0.02))
+    win = max(1, int(sr * 0.03))
     power = samples.astype(np.float32) ** 2
     kernel = np.ones(win, dtype=np.float32) / win
     env = np.sqrt(np.convolve(power, kernel, mode="same"))
     peak = float(env.max())
     if peak <= 0:
         return samples[:0]
-    thr = max(peak * 0.03, 0.004)
+    thr = max(peak * 0.012, 0.003)
     loud = np.flatnonzero(env > thr)
     if loud.size == 0:
         return samples[:0]
@@ -318,16 +319,67 @@ def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 30) -> np.ndarray:
     return samples[start:end]
 
 
-def _denoise(samples: np.ndarray, sr: int, amount: float = 0.9) -> np.ndarray:
-    """Stationary spectral-gate noise reduction; strips the model's ambient hum.
+_df_state: dict = {}
 
-    amount (prop_decrease) is how aggressively the noise floor is attenuated, 0..1.
+
+def _get_df():
+    """Lazily load DeepFilterNet3 (cached). Returns (model, df_state) or None.
+
+    deepfilternet 0.5.6 imports torchaudio.backend.common.AudioMetaData, removed in
+    recent torchaudio; we feed tensors straight to enhance() and never use df.io, so
+    a tiny shim lets the package import cleanly.
+    """
+    if "loaded" in _df_state:
+        return _df_state["loaded"]
+    try:
+        import sys
+        import types
+        import torchaudio
+        if "torchaudio.backend.common" not in sys.modules:
+            bc = types.ModuleType("torchaudio.backend.common")
+            bc.AudioMetaData = type("AudioMetaData", (), {})
+            b = types.ModuleType("torchaudio.backend")
+            b.common = bc
+            sys.modules["torchaudio.backend"] = b
+            sys.modules["torchaudio.backend.common"] = bc
+            torchaudio.backend = b
+        from df.enhance import init_df
+        model, state, _ = init_df()
+        _df_state["loaded"] = (model, state)
+        print("[server] loaded DeepFilterNet3 denoiser")
+    except Exception as e:
+        _df_state["loaded"] = None
+        print(f"[server] DeepFilterNet unavailable ({e}); falling back to noisereduce")
+    return _df_state["loaded"]
+
+
+def _denoise(samples: np.ndarray, sr: int, amount: float = 0.9) -> np.ndarray:
+    """Strip the model's ambient hum. Prefers DeepFilterNet3 (learned, artifact-free);
+    falls back to a stationary spectral gate if it can't load.
+
+    amount (0..1) eases off the suppression: 1.0 = full, lower keeps more of the
+    original (DeepFilterNet caps attenuation in dB; noisereduce scales prop_decrease).
     """
     if samples.size == 0 or amount <= 0:
         return samples
+    amount = float(np.clip(amount, 0.0, 1.0))
+    df = _get_df()
+    if df is not None:
+        import torch
+        from scipy.signal import resample_poly
+        model, state = df
+        dsr = state.sr()
+        up = resample_poly(samples, dsr, sr).astype(np.float32) if sr != dsr else samples
+        from df.enhance import enhance
+        atten = None if amount >= 0.999 else amount * 60.0
+        out = enhance(model, state, torch.from_numpy(np.ascontiguousarray(up)).unsqueeze(0),
+                      atten_lim_db=atten)
+        out = out.squeeze(0).cpu().numpy()
+        if sr != dsr:
+            out = resample_poly(out, sr, dsr)
+        return np.asarray(out, dtype=np.float32)
     import noisereduce as nr
-    out = nr.reduce_noise(y=samples, sr=sr, stationary=True,
-                          prop_decrease=float(np.clip(amount, 0.0, 1.0)))
+    out = nr.reduce_noise(y=samples, sr=sr, stationary=True, prop_decrease=amount)
     return np.asarray(out, dtype=np.float32)
 
 

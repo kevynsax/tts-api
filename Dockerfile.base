@@ -27,6 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         chatterbox-tts \
         kokoro "misaki[en]" \
         snac \
+        boson-multimodal bitsandbytes accelerate \
         soundfile fastapi "uvicorn[standard]" setproctitle
 
 RUN python -m spacy download en_core_web_sm || true

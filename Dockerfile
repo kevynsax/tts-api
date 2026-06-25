@@ -3,8 +3,9 @@
 #
 # The native server.py uses MLX (Apple Silicon + Metal) and cannot run in a Linux
 # container, so this image runs the PyTorch path (server_cpu.py). It serves the
-# Chatterbox, Kokoro, and Orpheus backends and runs on CPU or CUDA (auto-detected;
-# Orpheus is a 3B LLM and wants a GPU). OpenAudio/Fish is MLX-host-only and is not
+# Chatterbox, Kokoro, Orpheus, and Higgs Audio v2 backends and runs on CPU or CUDA
+# (auto-detected; Orpheus/Higgs are 3B LLMs and want a GPU; Higgs defaults to 4-bit
+# bitsandbytes quantization, ~5 GB VRAM). OpenAudio/Fish is MLX-host-only and is not
 # included here.
 #
 # Build (on an x86_64 builder, or with buildx for cross-build):
@@ -46,6 +47,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         chatterbox-tts \
         kokoro "misaki[en]" \
         snac \
+        boson-multimodal bitsandbytes accelerate \
         soundfile fastapi "uvicorn[standard]" setproctitle
 
 # Pre-download the spaCy English model misaki uses (avoids a first-request stall).

@@ -9,6 +9,9 @@ CUDA (auto-detected). The native server.py remains the fast path on the Mac host
 Backends (selectable at runtime):
     chatterbox  -> chatterbox-tts (PyTorch), clones from a reference clip
     kokoro      -> kokoro (PyTorch), small/fast, named voices (e.g. af_heart)
+    orpheus     -> orpheus-3b (PyTorch) + SNAC, named voices, GPU
+    higgs       -> Higgs Audio v2 (PyTorch), GPU; 4-bit quantized by default,
+                   optional voice cloning via a reference clip + transcript
   (OpenAudio/Fish is MLX-host-only; fish-speech has no clean pip inference API.)
 
 Routes (same shape as server.py):
@@ -65,6 +68,16 @@ KOKORO_REPO = os.environ.get("KOKORO_REPO", "hexgrad/Kokoro-82M")
 # canopylabs/orpheus-3b-0.1-ft is the gated upstream (set ORPHEUS_REPO + HF_TOKEN).
 ORPHEUS_REPO = os.environ.get("ORPHEUS_REPO", "unsloth/orpheus-3b-0.1-ft")
 ORPHEUS_SNAC_REPO = os.environ.get("ORPHEUS_SNAC_REPO", "hubertsiuzdak/snac_24khz")
+
+# Higgs Audio v2 (PyTorch). The bf16 3B wants ~24 GB VRAM, so default to 4-bit
+# bitsandbytes (NF4) quantization (~5 GB; 8-bit ~7 GB; 0 = full bf16). Quantization
+# needs CUDA + bitsandbytes; on CPU it always loads full precision.
+HIGGS_REPO = os.environ.get("HIGGS_REPO", "bosonai/higgs-audio-v2-generation-3B-base")
+HIGGS_TOKENIZER_REPO = os.environ.get(
+    "HIGGS_TOKENIZER_REPO", "bosonai/higgs-audio-v2-tokenizer")
+HIGGS_QUANT_BITS = int(os.environ.get("HIGGS_QUANT_BITS", "4"))
+HIGGS_MAX_NEW_TOKENS = int(os.environ.get("HIGGS_MAX_NEW_TOKENS", "2048"))
+HIGGS_SCENE = os.environ.get("HIGGS_SCENE", "Audio is recorded from a quiet room.")
 
 # Switchable backends. `key` is what clients pass; everything PyTorch-based here.
 MODEL_CATALOG = [
@@ -207,8 +220,54 @@ def _load_orpheus(device: str) -> dict:
             "snac": snac, "sr": 24000}
 
 
+def _load_higgs(device: str) -> dict:
+    import torch
+    from boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+
+    compute_dtype = torch.float16 if device == "cuda" else torch.float32
+    quantize = HIGGS_QUANT_BITS in (4, 8) and device == "cuda"
+
+    if quantize:
+        # Upstream's serve engine has no quantization flag and does
+        # `HiggsAudioModel.from_pretrained(...).to(device)`. Inject a
+        # BitsAndBytesConfig into that call for the duration of construction.
+        from transformers import BitsAndBytesConfig
+        from boson_multimodal.model.higgs_audio import HiggsAudioModel
+        if HIGGS_QUANT_BITS == 4:
+            qconf = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+        else:
+            qconf = BitsAndBytesConfig(load_in_8bit=True)
+        _orig = HiggsAudioModel.from_pretrained
+
+        def _patched(*a, **kw):
+            kw.setdefault("quantization_config", qconf)
+            kw.setdefault("device_map", {"": device})
+            model = _orig(*a, **kw)
+            # The engine chains `.to(device)` after from_pretrained, which bnb-quantized
+            # models reject; they're already placed via device_map, so make it a no-op.
+            model.to = lambda *args, **kwargs: model
+            return model
+
+        HiggsAudioModel.from_pretrained = staticmethod(_patched)
+        try:
+            engine = HiggsAudioServeEngine(
+                HIGGS_REPO, HIGGS_TOKENIZER_REPO,
+                device=device, torch_dtype=compute_dtype)
+        finally:
+            HiggsAudioModel.from_pretrained = _orig
+        print(f"[server-cpu] Higgs loaded in {HIGGS_QUANT_BITS}-bit quantization")
+    else:
+        engine = HiggsAudioServeEngine(
+            HIGGS_REPO, HIGGS_TOKENIZER_REPO,
+            device=device, torch_dtype=compute_dtype)
+
+    return {"backend": "higgs", "engine": engine, "sr": 24000}
+
+
 _BACKEND_LOADERS = {"chatterbox": _load_chatterbox, "kokoro": _load_kokoro,
-                    "orpheus": _load_orpheus}
+                    "orpheus": _load_orpheus, "higgs": _load_higgs}
 
 
 def _load_model_on_worker(model_key: str) -> None:
@@ -342,6 +401,45 @@ def resolve_voice(voice: str) -> str | None:
         if p.exists():
             return str(p)
     return None
+
+
+def resolve_ref_text(voice: str) -> str | None:
+    """Transcript for a cloned voice from voices/<voice>.txt, if present."""
+    if not voice or voice in ("default", "chatterbox"):
+        return None
+    p = VOICES_DIR / f"{voice}.txt"
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
+def _higgs_generate(loaded: dict, text: str, ref_audio: str | None,
+                    ref_text: str | None, temperature: float | None):
+    """Render speech with Higgs Audio v2. With a reference clip + its transcript it
+    zero-shot clones the voice; otherwise it picks a smart-voice default."""
+    import base64
+    from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+
+    engine = loaded["engine"]
+    system = ("Generate audio following instruction.\n\n"
+              f"<|scene_desc_start|>\n{HIGGS_SCENE}\n<|scene_desc_end|>")
+    messages = [Message(role="system", content=system)]
+    if ref_audio and ref_text:
+        with open(ref_audio, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        messages.append(Message(role="user", content=ref_text))
+        messages.append(Message(role="assistant",
+                                content=AudioContent(raw_audio=b64, audio_url="")))
+    messages.append(Message(role="user", content=text))
+
+    out = engine.generate(
+        chat_ml_sample=ChatMLSample(messages=messages),
+        max_new_tokens=HIGGS_MAX_NEW_TOKENS,
+        temperature=temperature if temperature is not None else 0.3,
+        top_p=0.95, top_k=50,
+        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+    )
+    if out.audio is None or len(out.audio) == 0:
+        raise HTTPException(500, "no audio produced")
+    return np.asarray(out.audio, dtype=np.float32), int(out.sampling_rate or loaded["sr"])
 
 
 def _clone_voices() -> list[str]:
@@ -497,6 +595,11 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
         if len(codes) < 7:
             raise HTTPException(500, "no audio produced")
         samples = _orpheus_decode(loaded, codes)
+    elif backend == "higgs":
+        ref = resolve_voice(req.voice)
+        ref_text = (req.ref_text or resolve_ref_text(req.voice)) if ref else None
+        voice_label = req.voice if (ref and ref_text) else "default"
+        samples, sr = _higgs_generate(loaded, req.input, ref, ref_text, req.temperature)
     else:  # chatterbox
         ref = resolve_voice(req.voice)
         voice_label = req.voice if ref else "default"
