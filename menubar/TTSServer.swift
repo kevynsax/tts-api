@@ -15,6 +15,7 @@ let availableModels: [TTSModel] = [
     TTSModel(label: "OpenAudio (Fish S2 Pro)", repo: "mlx-community/fish-audio-s2-pro-bf16"),
     TTSModel(label: "Kokoro", repo: "mlx-community/Kokoro-82M-bf16"),
     TTSModel(label: "Orpheus", repo: "mlx-community/orpheus-3b-0.1-ft-4bit"),
+    TTSModel(label: "Higgs Audio v2", repo: "mlx-community/higgs-audio-v2-3B-mlx-q6"),
 ]
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

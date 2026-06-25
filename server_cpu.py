@@ -71,6 +71,7 @@ MODEL_CATALOG = [
     {"key": "chatterbox", "label": "Chatterbox", "backend": "chatterbox"},
     {"key": "kokoro", "label": "Kokoro", "backend": "kokoro"},
     {"key": "orpheus", "label": "Orpheus", "backend": "orpheus"},
+    {"key": "higgs", "label": "Higgs Audio v2", "backend": "higgs"},
 ]
 KNOWN_KEYS = {m["key"] for m in MODEL_CATALOG}
 
@@ -215,6 +216,10 @@ def _load_model_on_worker(model_key: str) -> None:
     backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == model_key), None)
     if backend is None:
         _set_status(state="error", model=model_key, error=f"unknown model '{model_key}'")
+        return
+    if backend not in _BACKEND_LOADERS:
+        _set_status(state="error", model=model_key,
+                    error=f"'{model_key}' is MLX-only and not supported on the CPU server")
         return
     _set_status(state="loading", model=model_key, error=None)
     device = pick_device()

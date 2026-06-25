@@ -85,6 +85,7 @@ MODEL_CATALOG = [
     {"key": "openaudio", "label": "OpenAudio (Fish S2 Pro)", "repo": "mlx-community/fish-audio-s2-pro-bf16"},
     {"key": "kokoro", "label": "Kokoro", "repo": "mlx-community/Kokoro-82M-bf16"},
     {"key": "orpheus", "label": "Orpheus", "repo": "mlx-community/orpheus-3b-0.1-ft-4bit"},
+    {"key": "higgs", "label": "Higgs Audio v2", "repo": "mlx-community/higgs-audio-v2-3B-mlx-q6"},
 ]
 KNOWN_MODELS = {m["key"]: m["repo"] for m in MODEL_CATALOG}
 
@@ -106,6 +107,10 @@ def _is_orpheus(model_id: str) -> bool:
     return "orpheus" in model_id.lower()
 
 
+def _is_higgs(model_id: str) -> bool:
+    return "higgs" in model_id.lower()
+
+
 def _backend(model_id: str) -> str:
     if _is_kokoro(model_id):
         return "kokoro"
@@ -113,12 +118,15 @@ def _backend(model_id: str) -> str:
         return "fish"
     if _is_orpheus(model_id):
         return "orpheus"
+    if _is_higgs(model_id):
+        return "higgs"
     return "chatterbox"
 
 
 IS_FISH = _is_fish(MODEL_ID)
 IS_KOKORO = _is_kokoro(MODEL_ID)
 IS_ORPHEUS = _is_orpheus(MODEL_ID)
+IS_HIGGS = _is_higgs(MODEL_ID)
 VOICES_DIR = Path(__file__).parent / "voices"
 API_KEY = os.environ.get("TTS_API_KEY")
 
@@ -180,7 +188,7 @@ def _patch_kokoro_vocoder() -> None:
 
 
 def _load_model_on_worker(model_id: str) -> None:
-    global MODEL_ID, IS_FISH, IS_KOKORO, IS_ORPHEUS
+    global MODEL_ID, IS_FISH, IS_KOKORO, IS_ORPHEUS, IS_HIGGS
     from mlx_audio.tts.utils import load_model
     backend = _backend(model_id)
     if backend == "kokoro":
@@ -202,6 +210,7 @@ def _load_model_on_worker(model_id: str) -> None:
     IS_FISH = _is_fish(model_id)
     IS_KOKORO = _is_kokoro(model_id)
     IS_ORPHEUS = _is_orpheus(model_id)
+    IS_HIGGS = _is_higgs(model_id)
     try:
         import mlx.core as mx
         mx.clear_cache()
@@ -241,6 +250,15 @@ class SpeechRequest(BaseModel):
     # Fish/OpenAudio voice cloning: transcript of the reference clip. If omitted,
     # falls back to voices/<voice>.txt when present.
     ref_text: str | None = None
+    # Trim per-sentence leading/trailing silence so concatenated sentences butt up
+    # tightly (no gaps, no ambient-noise bursts at the joins). gap_ms inserts a fixed
+    # pause between sentences after trimming; 0 = none.
+    # denoise applies a stationary spectral-gate noise reducer to the rendered audio.
+    # trim_silence/denoise default to None = auto: on for Orpheus, off elsewhere.
+    trim_silence: bool | None = None
+    gap_ms: int = 0
+    denoise: bool | None = None
+    denoise_amount: float = 0.9
 
 
 # ---- audio helpers ---------------------------------------------------------
@@ -271,6 +289,46 @@ def _find_ffmpeg() -> str | None:
 
 
 FFMPEG = _find_ffmpeg()
+
+
+def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 30) -> np.ndarray:
+    """Trim leading/trailing silence (and the ambient noise floor that lives in it).
+
+    Keeps everything above a peak-relative threshold (~-40 dB) plus a small absolute
+    floor, padded by pad_ms so consonant onsets/decays aren't clipped.
+    """
+    if samples.size == 0:
+        return samples
+    # Smoothed RMS envelope over ~20 ms so isolated spikes (residual spectral-gate
+    # noise) don't count as speech and keep the silence from being trimmed.
+    win = max(1, int(sr * 0.02))
+    power = samples.astype(np.float32) ** 2
+    kernel = np.ones(win, dtype=np.float32) / win
+    env = np.sqrt(np.convolve(power, kernel, mode="same"))
+    peak = float(env.max())
+    if peak <= 0:
+        return samples[:0]
+    thr = max(peak * 0.03, 0.004)
+    loud = np.flatnonzero(env > thr)
+    if loud.size == 0:
+        return samples[:0]
+    pad = int(sr * pad_ms / 1000)
+    start = max(0, int(loud[0]) - pad)
+    end = min(samples.size, int(loud[-1]) + 1 + pad)
+    return samples[start:end]
+
+
+def _denoise(samples: np.ndarray, sr: int, amount: float = 0.9) -> np.ndarray:
+    """Stationary spectral-gate noise reduction; strips the model's ambient hum.
+
+    amount (prop_decrease) is how aggressively the noise floor is attenuated, 0..1.
+    """
+    if samples.size == 0 or amount <= 0:
+        return samples
+    import noisereduce as nr
+    out = nr.reduce_noise(y=samples, sr=sr, stationary=True,
+                          prop_decrease=float(np.clip(amount, 0.0, 1.0)))
+    return np.asarray(out, dtype=np.float32)
 
 
 def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
@@ -377,6 +435,8 @@ def _voices_for(model_id: str) -> dict:
     if backend == "orpheus":
         return {"backend": backend, "cloning": True,
                 "voices": list(_ORPHEUS_VOICES) + clones}
+    if backend == "higgs":
+        return {"backend": backend, "cloning": True, "voices": ["default"] + clones}
     return {"backend": backend, "cloning": True, "voices": ["default"] + clones}
 
 
@@ -440,6 +500,23 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
                       f"Using '{voice_label}'.")
+    elif IS_HIGGS:
+        # Higgs Audio v2: no named voices and no lang_code. Cloning is optional via
+        # a reference clip + its transcript; the reference must be a mono 24 kHz
+        # array. Without a reference it runs "smart voice" mode.
+        kwargs.pop("speed", None)
+        voice_label = "default"
+        if ref_audio:
+            ref_text = req.ref_text or resolve_ref_text(req.voice)
+            if ref_text:
+                from mlx_audio.utils import load_audio
+                kwargs["ref_audio"] = load_audio(ref_audio, sample_rate=model.sample_rate)
+                kwargs["ref_text"] = ref_text
+                voice_label = req.voice
+            else:
+                print(f"[speech] note: no transcript for '{req.voice}'; add "
+                      f"voices/{req.voice}.txt or send ref_text to clone. "
+                      f"Using smart-voice default.")
     else:
         kwargs["lang_code"] = lang_code
         voice_label = req.voice if ref_audio else "default"
@@ -456,16 +533,35 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     print(f"[speech] model={MODEL_ID} voice={voice_label} fmt={req.response_format} "
           f"lang={lang_code} chars={len(req.input)} text={preview!r}")
 
+    do_trim = req.trim_silence if req.trim_silence is not None else IS_ORPHEUS
+    do_denoise = req.denoise if req.denoise is not None else IS_ORPHEUS
+
     gen_start = time.perf_counter()
     chunks: list[np.ndarray] = []
     sr = 24000
     for result in model.generate(text=req.input, verbose=False, **kwargs):
         sr = result.sample_rate or sr
-        chunks.append(np.asarray(result.audio, dtype=np.float32))
+        audio_chunk = np.asarray(result.audio, dtype=np.float32)
+        # Denoise before trimming: the ambient floor otherwise reads as "loud" and
+        # defeats the silence detector, so the gaps wouldn't shrink.
+        if do_denoise:
+            audio_chunk = _denoise(audio_chunk, sr, req.denoise_amount)
+        if do_trim:
+            audio_chunk = _trim_silence(audio_chunk, sr)
+        if audio_chunk.size:
+            chunks.append(audio_chunk)
     if not chunks:
         raise HTTPException(500, "no audio produced")
     gen_secs = time.perf_counter() - gen_start
 
+    if do_trim and req.gap_ms > 0:
+        gap = np.zeros(int(sr * req.gap_ms / 1000), dtype=np.float32)
+        joined: list[np.ndarray] = []
+        for i, c in enumerate(chunks):
+            if i:
+                joined.append(gap)
+            joined.append(c)
+        chunks = joined
     samples = np.concatenate(chunks)
     duration = len(samples) / sr
     encode_start = time.perf_counter()
