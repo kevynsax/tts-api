@@ -315,7 +315,8 @@ class SpeechRequest(BaseModel):
     language: str | None = None
     exaggeration: float | None = None
     cfg_weight: float | None = None
-    temperature: float | None = None  # Orpheus sampling temperature
+    temperature: float | None = None  # Orpheus/Higgs sampling temperature
+    ref_text: str | None = None  # Higgs voice-clone reference transcript
 
 
 class LoadModelRequest(BaseModel):

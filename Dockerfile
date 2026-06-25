@@ -24,11 +24,12 @@
 FROM python:3.11-slim
 
 # ffmpeg: compressed audio output. espeak-ng: Kokoro G2P fallback / non-English.
-# git: some HF model repos need it.
+# git: some HF model repos need it. gcc + libc6-dev: bitsandbytes JIT-compiles a
+# triton CUDA helper at import and needs a C compiler with the libc headers.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg git espeak-ng
+    && apt-get install -y --no-install-recommends ffmpeg git espeak-ng gcc libc6-dev
 
 WORKDIR /app
 
