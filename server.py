@@ -717,10 +717,10 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     do_trim = req.trim_silence if req.trim_silence is not None else IS_ORPHEUS
     do_denoise = req.denoise if req.denoise is not None else IS_ORPHEUS
 
-    # Pin the RNG so a voice is reproducible across requests. Fish/OpenAudio sampling
-    # is stochastic and otherwise picks a different voice every call, so it defaults
-    # to a fixed seed; other models only seed when the request asks for it.
-    seed = req.seed if req.seed is not None else (_FISH_SEED if IS_FISH else None)
+    # Pin the RNG so a voice is reproducible across requests. Fish/OpenAudio and Higgs
+    # sampling is stochastic and otherwise picks a different voice every call, so they
+    # default to a fixed seed; other models only seed when the request asks for it.
+    seed = req.seed if req.seed is not None else (_FISH_SEED if (IS_FISH or IS_HIGGS) else None)
     if seed is not None:
         import mlx.core as mx
         mx.random.seed(int(seed))
