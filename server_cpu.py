@@ -246,6 +246,11 @@ def _load_higgs(device: str) -> dict:
     if "device_map" not in kwargs:
         model = model.to(device)
     model.eval()
+
+    audio_tokenizer = getattr(processor, "audio_tokenizer", None)
+    if audio_tokenizer is not None and hasattr(audio_tokenizer, "to"):
+        audio_tokenizer.to(device)
+
     return {"backend": "higgs", "model": model, "processor": processor, "sr": 24000}
 
 
