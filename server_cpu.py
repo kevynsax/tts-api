@@ -77,8 +77,10 @@ HIGGS_REPO = os.environ.get("HIGGS_REPO", "eustlb/higgs-audio-v2-generation-3B-b
 HIGGS_QUANT_BITS = int(os.environ.get("HIGGS_QUANT_BITS", "4"))
 HIGGS_MAX_NEW_TOKENS = int(os.environ.get("HIGGS_MAX_NEW_TOKENS", "2048"))
 HIGGS_SCENE = os.environ.get("HIGGS_SCENE", "Audio is recorded from a quiet room.")
-# Higgs sampling is stochastic; pin a fixed seed so a voice reproduces across requests.
-HIGGS_SEED = 42
+# Fixed default seed so every stochastic sampler (Chatterbox, Orpheus, Higgs) reproduces
+# the same voice across requests. Kokoro is deterministic and unaffected. Override
+# per-request with SpeechRequest.seed.
+_DEFAULT_SEED = 42
 
 # Switchable backends. `key` is what clients pass; everything PyTorch-based here.
 MODEL_CATALOG = [
@@ -678,9 +680,9 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
         raise HTTPException(400, "input is empty")
 
     req.voice = _resolve_voice_name(MODEL_KEY, req.voice)
-    # Higgs otherwise picks a different voice every call, so it defaults to a fixed
-    # seed; other backends only seed when the request asks for it.
-    seed = req.seed if req.seed is not None else (HIGGS_SEED if MODEL_KEY == "higgs" else None)
+    # Pin the RNG so a voice is reproducible across requests; every sampler otherwise
+    # picks a different voice each call. Kokoro is deterministic and unaffected.
+    seed = req.seed if req.seed is not None else _DEFAULT_SEED
     if seed is not None:
         import torch
         torch.manual_seed(int(seed))
