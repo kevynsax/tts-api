@@ -317,6 +317,9 @@ class SpeechRequest(BaseModel):
     cfg_weight: float | None = None
     temperature: float | None = None  # Orpheus/Higgs sampling temperature
     ref_text: str | None = None  # Higgs voice-clone reference transcript
+    # RNG seed: pin sampling so a voice reproduces across requests. (Fish/OpenAudio,
+    # which most needs this, is MLX-only and lives in server.py.)
+    seed: int | None = None
 
 
 class LoadModelRequest(BaseModel):
@@ -464,14 +467,107 @@ def _kokoro_repo_voices() -> list[str]:
     return _kokoro_voices_cache[KOKORO_REPO]
 
 
-def _voices_for(key: str) -> dict:
+# Each model presents the SAME underlying clip under a different real first name, so
+# the UI shows distinct names per model and the name alone tells you which model made
+# a clip. Names keep the country/gender of the source voice (GB, US, BR, PT). Kept in
+# sync with server.py.
+VOICE_ALIASES: dict[str, dict[str, str]] = {
+    "chatterbox": {
+        "default": "Oliver",
+        "en-GB-RyanNeural": "Arthur", "en-GB-SoniaNeural": "Eleanor",
+        "en-US-AndrewNeural": "Samuel", "en-US-AvaNeural": "Rachel",
+        "en-US-BrianNeural": "Henry", "en-US-EmmaNeural": "Ruth",
+        "pt-BR-AntonioNeural": "Mateus", "pt-BR-FranciscaNeural": "Helena",
+        "pt-BR-ThalitaMultilingualNeural": "Beatriz",
+        "pt-PT-DuarteNeural": "Tomás", "pt-PT-RaquelNeural": "Inês",
+    },
+    "openaudio": {
+        "default": "Theodore",
+        "en-GB-RyanNeural": "Edward", "en-GB-SoniaNeural": "Charlotte",
+        "en-US-AndrewNeural": "Nathan", "en-US-AvaNeural": "Grace",
+        "en-US-BrianNeural": "Walter", "en-US-EmmaNeural": "Naomi",
+        "pt-BR-AntonioNeural": "Rafael", "pt-BR-FranciscaNeural": "Larissa",
+        "pt-BR-ThalitaMultilingualNeural": "Camila",
+        "pt-PT-DuarteNeural": "Gonçalo", "pt-PT-RaquelNeural": "Matilde",
+    },
+    "higgs": {
+        "default": "Julian",
+        "en-GB-RyanNeural": "Sebastian", "en-GB-SoniaNeural": "Imogen",
+        "en-US-AndrewNeural": "Caleb", "en-US-AvaNeural": "Vivian",
+        "en-US-BrianNeural": "Gordon", "en-US-EmmaNeural": "Hazel",
+        "pt-BR-AntonioNeural": "Bruno", "pt-BR-FranciscaNeural": "Renata",
+        "pt-BR-ThalitaMultilingualNeural": "Bianca",
+        "pt-PT-DuarteNeural": "Afonso", "pt-PT-RaquelNeural": "Carolina",
+    },
+    "orpheus": {
+        "tara": "Sophie", "leah": "Diana", "jess": "Megan", "leo": "Marcus",
+        "dan": "Victor", "mia": "Paula", "zac": "Derek", "zoe": "Tessa",
+    },
+    "kokoro": {
+        "af_heart": "Hannah", "af_bella": "Bella", "af_nicole": "Nicole",
+        "af_sarah": "Sarah", "af_sky": "Skyler", "af_alloy": "Allison",
+        "af_aoede": "Audrey", "af_jessica": "Jessica", "af_kore": "Cora",
+        "af_nova": "Nora", "af_river": "Riley",
+        "am_adam": "Adam", "am_michael": "Michael", "am_echo": "Elliot",
+        "am_eric": "Eric", "am_fenrir": "Fenton", "am_liam": "Liam",
+        "am_onyx": "Owen", "am_puck": "Parker", "am_santa": "Nicholas",
+        "bf_emma": "Emily", "bf_alice": "Alice", "bf_isabella": "Isabella",
+        "bf_lily": "Lily", "bm_daniel": "Daniel", "bm_george": "George",
+        "bm_lewis": "Lewis", "bm_fable": "Felix",
+    },
+}
+
+_DERIVE_KOKORO = re.compile(r"^[a-z]{2}_(.+)$")
+_DERIVE_AZURE = re.compile(r"^[a-z]{2}-[A-Z]{2}-(.+?)(?:Multilingual)?Neural$")
+
+
+def _derive_name(raw: str) -> str:
+    """Fallback display name for a voice with no curated alias."""
+    m = _DERIVE_AZURE.match(raw)
+    if m:
+        return m.group(1)
+    m = _DERIVE_KOKORO.match(raw)
+    if m:
+        return m.group(1).replace("_", " ").title()
+    return raw[:1].upper() + raw[1:] if raw else raw
+
+
+def _display_voice(key: str, raw: str) -> str:
+    return VOICE_ALIASES.get(key, {}).get(raw) or _derive_name(raw)
+
+
+def _raw_voices_for(key: str) -> tuple[list[str], bool]:
+    """Underlying voice ids a model accepts, plus whether it supports cloning."""
     backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == key), "chatterbox")
     if backend == "kokoro":
-        return {"backend": backend, "cloning": False,
-                "voices": _kokoro_repo_voices() or ["af_heart"]}
+        return (_kokoro_repo_voices() or ["af_heart"]), False
     if backend == "orpheus":  # named voices only; cloning is unreliable on Orpheus
-        return {"backend": backend, "cloning": False, "voices": list(_ORPHEUS_VOICES)}
-    return {"backend": backend, "cloning": True, "voices": ["default"] + _clone_voices()}
+        return list(_ORPHEUS_VOICES), False
+    return (["default"] + _clone_voices()), True
+
+
+def _resolve_voice_name(key: str, name: str) -> str:
+    """Map a display name back to its underlying voice id. Raw ids and unknown names
+    pass through unchanged (so old clients keep working)."""
+    if not name:
+        return name
+    low = name.strip().lower()
+    raw, _ = _raw_voices_for(key)
+    for v in raw:
+        if _display_voice(key, v).lower() == low:
+            return v
+    return name
+
+
+def _voices_for(key: str) -> dict:
+    """Voices a model accepts. `voices` keeps the underlying ids (so clients can group
+    them by language/locale); `names` maps each id to its model-specific display name.
+    Requests may send either the id or the display name."""
+    backend = next((m["backend"] for m in MODEL_CATALOG if m["key"] == key), "chatterbox")
+    raw, cloning = _raw_voices_for(key)
+    return {"backend": backend, "cloning": cloning,
+            "voices": raw,
+            "names": {v: _display_voice(key, v) for v in raw}}
 
 
 # ---- Kokoro helpers --------------------------------------------------------
@@ -574,6 +670,11 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     if not req.input.strip():
         raise HTTPException(400, "input is empty")
 
+    req.voice = _resolve_voice_name(MODEL_KEY, req.voice)
+    if req.seed is not None:
+        import torch
+        torch.manual_seed(int(req.seed))
+        np.random.seed(int(req.seed) % (2 ** 32))
     backend = loaded["backend"]
     sr = loaded["sr"]
     lang = (req.language or "").strip().lower()

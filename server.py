@@ -89,6 +89,10 @@ MODEL_CATALOG = [
 ]
 KNOWN_MODELS = {m["key"]: m["repo"] for m in MODEL_CATALOG}
 
+# Fixed default seed for Fish/OpenAudio so its stochastic sampler reproduces the same
+# voice across requests. Override per-request with SpeechRequest.seed.
+_FISH_SEED = 42
+
 MODEL_ID = os.environ.get("TTS_MODEL") or os.environ.get(
     "CHATTERBOX_MODEL", "mlx-community/chatterbox-fp16")
 MODEL_ID = KNOWN_MODELS.get(MODEL_ID.lower(), MODEL_ID)
@@ -187,12 +191,37 @@ def _patch_kokoro_vocoder() -> None:
     print("[server] applied kokoro vocoder length-mismatch patch")
 
 
+def _patch_fish_snake() -> None:
+    """The Fish DAC vocoder's Snake activation evaluates sin(alpha*x) in bf16,
+    quantizing the phase and adding metallic high-frequency artifacts. Compute it
+    in float32; the rest of the codec stays bf16."""
+    try:
+        from mlx_audio.codec.models.fish_s1_dac import fish_s1_dac as _dac
+        import mlx.core as mx
+    except Exception:
+        return
+    if getattr(_dac, "_tts_snake_patched", False):
+        return
+
+    def _snake(x, alpha):
+        xf = x.astype(mx.float32)
+        af = alpha.astype(mx.float32)
+        out = xf + mx.reciprocal(af + 1e-9) * mx.power(mx.sin(af * xf), 2)
+        return out.astype(x.dtype)
+
+    _dac.snake = _snake
+    _dac._tts_snake_patched = True
+    print("[server] applied fish snake fp32 patch")
+
+
 def _load_model_on_worker(model_id: str) -> None:
     global MODEL_ID, IS_FISH, IS_KOKORO, IS_ORPHEUS, IS_HIGGS
     from mlx_audio.tts.utils import load_model
     backend = _backend(model_id)
     if backend == "kokoro":
         _patch_kokoro_vocoder()
+    if backend == "fish":
+        _patch_fish_snake()
     _set_status(state="loading", model=model_id, error=None)
     print(f"[server] loading {model_id} (backend={backend}) ...")
     try:
@@ -250,6 +279,10 @@ class SpeechRequest(BaseModel):
     # Fish/OpenAudio voice cloning: transcript of the reference clip. If omitted,
     # falls back to voices/<voice>.txt when present.
     ref_text: str | None = None
+    # RNG seed. Fish/OpenAudio sampling is stochastic, so without a fixed seed the
+    # voice drifts between requests; defaults to a fixed seed for Fish so the same
+    # voice stays consistent. Pass an int to override, or for any model.
+    seed: int | None = None
     # Trim per-sentence leading/trailing silence so concatenated sentences butt up
     # tightly (no gaps, no ambient-noise bursts at the joins). gap_ms inserts a fixed
     # pause between sentences after trimming; 0 = none.
@@ -477,19 +510,114 @@ def _kokoro_voices(repo: str) -> list[str]:
     return _kokoro_voices_cache[repo]
 
 
-def _voices_for(model_id: str) -> dict:
-    """Voices the given model accepts, plus whether it supports cloning."""
+def _model_key(model_id: str) -> str:
+    """Catalog key for a model id/repo (used to pick its voice-name set)."""
+    for m in MODEL_CATALOG:
+        if model_id in (m["repo"], m["key"]):
+            return m["key"]
+    return _backend(model_id)
+
+
+# Each model presents the SAME underlying clip under a different real first name, so
+# the UI shows distinct names per model and the name alone tells you which model made
+# a clip. Names keep the country/gender of the source voice (GB, US, BR, PT).
+VOICE_ALIASES: dict[str, dict[str, str]] = {
+    "chatterbox": {
+        "default": "Oliver",
+        "en-GB-RyanNeural": "Arthur", "en-GB-SoniaNeural": "Eleanor",
+        "en-US-AndrewNeural": "Samuel", "en-US-AvaNeural": "Rachel",
+        "en-US-BrianNeural": "Henry", "en-US-EmmaNeural": "Ruth",
+        "pt-BR-AntonioNeural": "Mateus", "pt-BR-FranciscaNeural": "Helena",
+        "pt-BR-ThalitaMultilingualNeural": "Beatriz",
+        "pt-PT-DuarteNeural": "Tomás", "pt-PT-RaquelNeural": "Inês",
+    },
+    "openaudio": {
+        "default": "Theodore",
+        "en-GB-RyanNeural": "Edward", "en-GB-SoniaNeural": "Charlotte",
+        "en-US-AndrewNeural": "Nathan", "en-US-AvaNeural": "Grace",
+        "en-US-BrianNeural": "Walter", "en-US-EmmaNeural": "Naomi",
+        "pt-BR-AntonioNeural": "Rafael", "pt-BR-FranciscaNeural": "Larissa",
+        "pt-BR-ThalitaMultilingualNeural": "Camila",
+        "pt-PT-DuarteNeural": "Gonçalo", "pt-PT-RaquelNeural": "Matilde",
+    },
+    "higgs": {
+        "default": "Julian",
+        "en-GB-RyanNeural": "Sebastian", "en-GB-SoniaNeural": "Imogen",
+        "en-US-AndrewNeural": "Caleb", "en-US-AvaNeural": "Vivian",
+        "en-US-BrianNeural": "Gordon", "en-US-EmmaNeural": "Hazel",
+        "pt-BR-AntonioNeural": "Bruno", "pt-BR-FranciscaNeural": "Renata",
+        "pt-BR-ThalitaMultilingualNeural": "Bianca",
+        "pt-PT-DuarteNeural": "Afonso", "pt-PT-RaquelNeural": "Carolina",
+    },
+    "orpheus": {
+        "tara": "Sophie", "leah": "Diana", "jess": "Megan", "leo": "Marcus",
+        "dan": "Victor", "mia": "Paula", "zac": "Derek", "zoe": "Tessa",
+    },
+    "kokoro": {
+        "af_heart": "Hannah", "af_bella": "Bella", "af_nicole": "Nicole",
+        "af_sarah": "Sarah", "af_sky": "Skyler", "af_alloy": "Allison",
+        "af_aoede": "Audrey", "af_jessica": "Jessica", "af_kore": "Cora",
+        "af_nova": "Nora", "af_river": "Riley",
+        "am_adam": "Adam", "am_michael": "Michael", "am_echo": "Elliot",
+        "am_eric": "Eric", "am_fenrir": "Fenton", "am_liam": "Liam",
+        "am_onyx": "Owen", "am_puck": "Parker", "am_santa": "Nicholas",
+        "bf_emma": "Emily", "bf_alice": "Alice", "bf_isabella": "Isabella",
+        "bf_lily": "Lily", "bm_daniel": "Daniel", "bm_george": "George",
+        "bm_lewis": "Lewis", "bm_fable": "Felix",
+    },
+}
+
+_DERIVE_KOKORO = re.compile(r"^[a-z]{2}_(.+)$")
+_DERIVE_AZURE = re.compile(r"^[a-z]{2}-[A-Z]{2}-(.+?)(?:Multilingual)?Neural$")
+
+
+def _derive_name(raw: str) -> str:
+    """Fallback display name for a voice with no curated alias."""
+    m = _DERIVE_AZURE.match(raw)
+    if m:
+        return m.group(1)
+    m = _DERIVE_KOKORO.match(raw)
+    if m:
+        return m.group(1).replace("_", " ").title()
+    return raw[:1].upper() + raw[1:] if raw else raw
+
+
+def _display_voice(model_id: str, raw: str) -> str:
+    return VOICE_ALIASES.get(_model_key(model_id), {}).get(raw) or _derive_name(raw)
+
+
+def _raw_voices_for(model_id: str) -> tuple[list[str], bool]:
+    """Underlying voice ids a model accepts, plus whether it supports cloning."""
     backend = _backend(model_id)
     clones = _clone_voices()
     if backend == "kokoro":
-        return {"backend": backend, "cloning": False,
-                "voices": _kokoro_voices(model_id) or ["af_heart"]}
+        return (_kokoro_voices(model_id) or ["af_heart"]), False
     if backend == "orpheus":
-        return {"backend": backend, "cloning": True,
-                "voices": list(_ORPHEUS_VOICES) + clones}
-    if backend == "higgs":
-        return {"backend": backend, "cloning": True, "voices": ["default"] + clones}
-    return {"backend": backend, "cloning": True, "voices": ["default"] + clones}
+        return (list(_ORPHEUS_VOICES) + clones), True
+    return (["default"] + clones), True  # chatterbox, fish/openaudio, higgs
+
+
+def _resolve_voice_name(model_id: str, name: str) -> str:
+    """Map a display name back to its underlying voice id. Raw ids and unknown names
+    pass through unchanged (so old clients keep working)."""
+    if not name:
+        return name
+    low = name.strip().lower()
+    raw, _ = _raw_voices_for(model_id)
+    for v in raw:
+        if _display_voice(model_id, v).lower() == low:
+            return v
+    return name
+
+
+def _voices_for(model_id: str) -> dict:
+    """Voices a model accepts. `voices` keeps the underlying ids (so clients can group
+    them by language/locale); `names` maps each id to its model-specific display name.
+    Requests may send either the id or the display name."""
+    raw, cloning = _raw_voices_for(model_id)
+    return {"backend": _backend(model_id), "cloning": cloning,
+            "voices": raw,
+            "names": {v: _display_voice(model_id, v) for v in raw}}
 
 
 def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
@@ -503,6 +631,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     if not req.input.strip():
         raise HTTPException(400, "input is empty")
 
+    req.voice = _resolve_voice_name(MODEL_ID, req.voice)
     ref_audio = resolve_voice(req.voice)
     lang = (req.language or "").strip().lower()
     lang_code = lang if lang and lang != "unknown" else "en"
@@ -587,6 +716,14 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
 
     do_trim = req.trim_silence if req.trim_silence is not None else IS_ORPHEUS
     do_denoise = req.denoise if req.denoise is not None else IS_ORPHEUS
+
+    # Pin the RNG so a voice is reproducible across requests. Fish/OpenAudio sampling
+    # is stochastic and otherwise picks a different voice every call, so it defaults
+    # to a fixed seed; other models only seed when the request asks for it.
+    seed = req.seed if req.seed is not None else (_FISH_SEED if IS_FISH else None)
+    if seed is not None:
+        import mlx.core as mx
+        mx.random.seed(int(seed))
 
     gen_start = time.perf_counter()
     chunks: list[np.ndarray] = []
