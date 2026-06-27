@@ -76,6 +76,9 @@ ORPHEUS_SNAC_REPO = os.environ.get("ORPHEUS_SNAC_REPO", "hubertsiuzdak/snac_24kh
 HIGGS_REPO = os.environ.get("HIGGS_REPO", "eustlb/higgs-audio-v2-generation-3B-base")
 HIGGS_QUANT_BITS = int(os.environ.get("HIGGS_QUANT_BITS", "4"))
 HIGGS_MAX_NEW_TOKENS = int(os.environ.get("HIGGS_MAX_NEW_TOKENS", "2048"))
+# Long input in one generate() call overflows the model's token budget and the audio is
+# truncated; split it into sentence-sized chunks rendered separately and concatenated.
+HIGGS_MAX_CHARS = int(os.environ.get("HIGGS_MAX_CHARS", "350"))
 HIGGS_SCENE = os.environ.get("HIGGS_SCENE", "Audio is recorded from a quiet room.")
 # Fixed default seed so every stochastic sampler (Chatterbox, Orpheus, Higgs) reproduces
 # the same voice across requests. Kokoro is deterministic and unaffected. Override
@@ -407,29 +410,54 @@ def resolve_ref_text(voice: str) -> str | None:
     return p.read_text(encoding="utf-8").strip() if p.exists() else None
 
 
+_SENT_SPLIT = re.compile(r"(?<=[.!?…。！？])\s+|\n+")
+
+
+def _chunk_text(text: str, max_chars: int) -> list[str]:
+    """Greedily pack sentences into chunks no longer than max_chars, hard-wrapping any
+    lone sentence that still overflows on a word boundary."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks, cur = [], ""
+    for sent in _SENT_SPLIT.split(text):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if cur and len(cur) + 1 + len(sent) > max_chars:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur} {sent}".strip()
+        while len(cur) > max_chars:
+            cut = cur.rfind(" ", 0, max_chars)
+            cut = cut if cut > 0 else max_chars
+            chunks.append(cur[:cut].strip())
+            cur = cur[cut:].strip()
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def _higgs_generate(loaded: dict, text: str, ref_audio: str | None,
                     ref_text: str | None, temperature: float | None):
     """Render speech with Higgs Audio v2 (native transformers). With a reference clip
-    + its transcript it zero-shot clones the voice; otherwise smart-voice default."""
+    + its transcript it zero-shot clones the voice; otherwise smart-voice default. Long
+    input is split into chunks (each within the token budget) and concatenated so the
+    audio isn't truncated; every chunk shares the reference, keeping one voice."""
     import tempfile
+    import torch
 
     model = loaded["model"]
     processor = loaded["processor"]
-    conversation = [
+    base = [
         {"role": "system",
          "content": [{"type": "text", "text": "Generate audio following instruction."}]},
         {"role": "scene", "content": [{"type": "text", "text": HIGGS_SCENE}]},
     ]
     if ref_audio and ref_text:
-        conversation.append({"role": "user", "content": [{"type": "text", "text": ref_text}]})
-        conversation.append({"role": "assistant",
-                             "content": [{"type": "audio", "url": ref_audio}]})
-    conversation.append({"role": "user", "content": [{"type": "text", "text": text}]})
-
-    inputs = processor.apply_chat_template(
-        conversation, add_generation_prompt=True, tokenize=True,
-        return_dict=True, sampling_rate=24000, return_tensors="pt",
-    ).to(model.device)
+        base.append({"role": "user", "content": [{"type": "text", "text": ref_text}]})
+        base.append({"role": "assistant",
+                     "content": [{"type": "audio", "url": ref_audio}]})
 
     gen_kwargs: dict = {"max_new_tokens": HIGGS_MAX_NEW_TOKENS}
     if temperature and temperature > 0:
@@ -437,20 +465,37 @@ def _higgs_generate(loaded: dict, text: str, ref_audio: str | None,
     else:
         gen_kwargs["do_sample"] = False
 
-    import torch
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **gen_kwargs)
-    decoded = processor.batch_decode(outputs)
+    segments: list[np.ndarray] = []
+    sr = 24000
+    for part in _chunk_text(text, HIGGS_MAX_CHARS) or [text]:
+        conversation = base + [{"role": "user", "content": [{"type": "text", "text": part}]}]
+        inputs = processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=True,
+            return_dict=True, sampling_rate=24000, return_tensors="pt",
+        ).to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **gen_kwargs)
+        decoded = processor.batch_decode(outputs)
+        # Let the processor reconstruct the waveform, then read it back as samples.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
+            processor.save_audio(decoded, tf.name)
+            seg, sr = sf.read(tf.name, dtype="float32")
+        if seg.ndim > 1:
+            seg = seg.mean(axis=1)
+        if seg.size:
+            segments.append(np.asarray(seg, dtype=np.float32))
 
-    # Let the processor reconstruct the waveform, then read it back as samples.
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tf:
-        processor.save_audio(decoded, tf.name)
-        samples, sr = sf.read(tf.name, dtype="float32")
-    if samples.ndim > 1:
-        samples = samples.mean(axis=1)
-    if samples.size == 0:
+    if not segments:
         raise HTTPException(500, "no audio produced")
-    return np.asarray(samples, dtype=np.float32), int(sr)
+    if len(segments) == 1:
+        return segments[0], int(sr)
+    gap = np.zeros(int(sr * 0.15), dtype=np.float32)
+    joined: list[np.ndarray] = []
+    for i, seg in enumerate(segments):
+        if i:
+            joined.append(gap)
+        joined.append(seg)
+    return np.concatenate(joined), int(sr)
 
 
 def _clone_voices() -> list[str]:

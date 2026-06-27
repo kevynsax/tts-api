@@ -325,12 +325,15 @@ def _find_ffmpeg() -> str | None:
 FFMPEG = _find_ffmpeg()
 
 
-def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 80) -> np.ndarray:
+def _trim_silence(
+    samples: np.ndarray, sr: int, head_pad_ms: int = 150, tail_pad_ms: int = 450
+) -> np.ndarray:
     """Trim leading/trailing silence (and the ambient noise floor that lives in it).
 
     Keeps everything above a peak-relative threshold plus a small absolute floor,
-    padded generously by pad_ms so word onsets/decays are never clipped. Only the
-    head and tail are touched; pauses inside the sentence are left intact.
+    padded generously so word onsets/decays are never clipped. The tail pad is much
+    larger than the head pad so each sentence keeps room to breathe afterwards. Only
+    the head and tail are touched; pauses inside the sentence are left intact.
     """
     if samples.size == 0:
         return samples
@@ -343,13 +346,14 @@ def _trim_silence(samples: np.ndarray, sr: int, pad_ms: int = 80) -> np.ndarray:
     peak = float(env.max())
     if peak <= 0:
         return samples[:0]
-    thr = max(peak * 0.012, 0.003)
+    thr = max(peak * 0.004, 0.0015)
     loud = np.flatnonzero(env > thr)
     if loud.size == 0:
         return samples[:0]
-    pad = int(sr * pad_ms / 1000)
-    start = max(0, int(loud[0]) - pad)
-    end = min(samples.size, int(loud[-1]) + 1 + pad)
+    head_pad = int(sr * head_pad_ms / 1000)
+    tail_pad = int(sr * tail_pad_ms / 1000)
+    start = max(0, int(loud[0]) - head_pad)
+    end = min(samples.size, int(loud[-1]) + 1 + tail_pad)
     return samples[start:end]
 
 
