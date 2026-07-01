@@ -475,6 +475,72 @@ def resolve_ref_text(voice: str) -> str | None:
     return None
 
 
+# Fish/OpenAudio and Higgs sample a brand-new speaker whenever they get no reference
+# clip, so the "default" voice drifts between requests even with a fixed seed (the RNG
+# stream depends on the text). Pin it by cloning every default-voice request from an
+# anchor clip in voices/auto/. The anchors are committed to the repo so every
+# deployment (MLX or CPU, any machine) uses the same default voice; if one is missing
+# it is regenerated once with a fixed seed, but that regenerated voice is local to
+# the deployment until committed.
+_ANCHOR_DIR = VOICES_DIR / "auto"
+_ANCHOR_TEXT = ("Here is a quick sample of my default voice reading aloud in the "
+                "same clear and steady tone that I will always use for you.")
+
+
+def _tighten_anchor(samples: np.ndarray, sr: int) -> np.ndarray:
+    """Trim edge silence and collapse internal pauses to ~250 ms. A reference clip
+    with long dead air teaches the model to emit silence until the token budget runs
+    out, so the anchor must be tight."""
+    win = max(1, int(sr * 0.03))
+    kernel = np.ones(win, dtype=np.float32) / win
+    env = np.sqrt(np.convolve(samples.astype(np.float32) ** 2, kernel, mode="same"))
+    thr = max(float(env.max()) * 0.004, 0.0015)
+    loud = np.flatnonzero(env > thr)
+    if loud.size == 0:
+        return samples
+    max_gap = int(sr * 0.25)
+    pieces, start, prev = [], int(loud[0]), int(loud[0])
+    for i in map(int, loud[1:]):
+        if i - prev > max_gap:
+            pieces.append(samples[start:prev + max_gap])
+            start = i
+        prev = i
+    pieces.append(samples[start:prev + 1])
+    return np.concatenate(pieces)
+
+
+def _default_anchor(model) -> tuple[str, str] | None:
+    """Return (wav_path, transcript) of the cached default-voice reference clip,
+    generating it on first use. None if generation fails (caller falls back to the
+    unanchored default)."""
+    wav = _ANCHOR_DIR / f"{_backend(MODEL_ID)}.wav"
+    txt = wav.with_suffix(".txt")
+    if wav.exists() and txt.exists():
+        return str(wav), txt.read_text(encoding="utf-8").strip()
+    try:
+        import mlx.core as mx
+        mx.random.seed(_DEFAULT_SEED)
+        chunks, sr = [], 24000
+        print("[speech] building default-voice anchor clip (one-time). Note: this "
+              "clip is local to this deployment; commit voices/auto/ to keep the "
+              "default voice identical across servers.")
+        for result in model.generate(text=_ANCHOR_TEXT, verbose=False):
+            sr = result.sample_rate or sr
+            chunk = np.asarray(result.audio, dtype=np.float32)
+            if chunk.size:
+                chunks.append(chunk)
+        if not chunks:
+            return None
+        _ANCHOR_DIR.mkdir(parents=True, exist_ok=True)
+        sf.write(str(wav), _tighten_anchor(np.concatenate(chunks), sr), sr)
+        txt.write_text(_ANCHOR_TEXT, encoding="utf-8")
+        return str(wav), _ANCHOR_TEXT
+    except Exception as e:
+        print(f"[speech] note: default-voice anchor failed ({e}); "
+              f"default voice may vary between calls.")
+        return None
+
+
 _KOKORO_VOICE_RE = re.compile(r"^[abefhijpz][fm]_")
 
 
@@ -669,6 +735,12 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
                       f"Using default voice.")
+        if "ref_audio" not in kwargs:
+            anchor = _default_anchor(model)
+            if anchor:
+                from mlx_audio.utils import load_audio
+                kwargs["ref_audio"] = load_audio(anchor[0], sample_rate=model.sample_rate)
+                kwargs["ref_text"] = anchor[1]
     elif IS_ORPHEUS:
         # Orpheus: named voices (tara, leah, ...), no lang_code. Cloning is
         # optional via a reference clip + its transcript; otherwise pick a named
@@ -703,6 +775,12 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
                       f"Using smart-voice default.")
+        if "ref_audio" not in kwargs:
+            anchor = _default_anchor(model)
+            if anchor:
+                from mlx_audio.utils import load_audio
+                kwargs["ref_audio"] = load_audio(anchor[0], sample_rate=model.sample_rate)
+                kwargs["ref_text"] = anchor[1]
     else:
         kwargs["lang_code"] = lang_code
         voice_label = req.voice if ref_audio else "default"

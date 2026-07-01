@@ -498,6 +498,67 @@ def _higgs_generate(loaded: dict, text: str, ref_audio: str | None,
     return np.concatenate(joined), int(sr)
 
 
+# Higgs samples a brand-new speaker whenever it gets no reference clip, so the
+# "default" voice drifts between requests even with a fixed seed (the RNG stream
+# depends on the text). Pin it by cloning every default-voice request from the anchor
+# clip in voices/auto/. The anchors are committed to the repo so every deployment
+# (MLX or CPU, any machine) uses the same default voice; if one is missing it is
+# regenerated once with a fixed seed, but that regenerated voice is local to the
+# deployment until committed. (Chatterbox's default is stable via its built-in
+# conditionals; Orpheus/Kokoro use named voices.) Kept in sync with server.py.
+_ANCHOR_DIR = VOICES_DIR / "auto"
+_ANCHOR_TEXT = ("Here is a quick sample of my default voice reading aloud in the "
+                "same clear and steady tone that I will always use for you.")
+
+
+def _tighten_anchor(samples: np.ndarray, sr: int) -> np.ndarray:
+    """Trim edge silence and collapse internal pauses to ~250 ms. A reference clip
+    with long dead air teaches the model to emit silence until the token budget runs
+    out, so the anchor must be tight."""
+    win = max(1, int(sr * 0.03))
+    kernel = np.ones(win, dtype=np.float32) / win
+    env = np.sqrt(np.convolve(samples.astype(np.float32) ** 2, kernel, mode="same"))
+    thr = max(float(env.max()) * 0.004, 0.0015)
+    loud = np.flatnonzero(env > thr)
+    if loud.size == 0:
+        return samples
+    max_gap = int(sr * 0.25)
+    pieces, start, prev = [], int(loud[0]), int(loud[0])
+    for i in map(int, loud[1:]):
+        if i - prev > max_gap:
+            pieces.append(samples[start:prev + max_gap])
+            start = i
+        prev = i
+    pieces.append(samples[start:prev + 1])
+    return np.concatenate(pieces)
+
+
+def _default_anchor(loaded: dict) -> tuple[str, str] | None:
+    """Return (wav_path, transcript) of the cached default-voice reference clip,
+    generating it on first use. None if generation fails (caller falls back to the
+    unanchored default)."""
+    wav = _ANCHOR_DIR / "higgs.wav"
+    txt = wav.with_suffix(".txt")
+    if wav.exists() and txt.exists():
+        return str(wav), txt.read_text(encoding="utf-8").strip()
+    try:
+        import torch
+        torch.manual_seed(_DEFAULT_SEED)
+        np.random.seed(_DEFAULT_SEED)
+        print("[speech] building default-voice anchor clip (one-time). Note: this "
+              "clip is local to this deployment; commit voices/auto/ to keep the "
+              "default voice identical across servers.")
+        samples, sr = _higgs_generate(loaded, _ANCHOR_TEXT, None, None, None)
+        _ANCHOR_DIR.mkdir(parents=True, exist_ok=True)
+        sf.write(str(wav), _tighten_anchor(samples, sr), sr)
+        txt.write_text(_ANCHOR_TEXT, encoding="utf-8")
+        return str(wav), _ANCHOR_TEXT
+    except Exception as e:
+        print(f"[speech] note: default-voice anchor failed ({e}); "
+              f"default voice may vary between calls.")
+        return None
+
+
 def _clone_voices() -> list[str]:
     if not VOICES_DIR.exists():
         return []
@@ -756,6 +817,13 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
         ref = resolve_voice(req.voice)
         ref_text = (req.ref_text or resolve_ref_text(req.voice)) if ref else None
         voice_label = req.voice if (ref and ref_text) else "default"
+        if not (ref and ref_text):
+            anchor = _default_anchor(loaded)
+            if anchor:
+                ref, ref_text = anchor
+            if seed is not None:
+                torch.manual_seed(int(seed))
+                np.random.seed(int(seed) % (2 ** 32))
         samples, sr = _higgs_generate(loaded, req.input, ref, ref_text, req.temperature)
     else:  # chatterbox
         ref = resolve_voice(req.voice)
