@@ -691,6 +691,55 @@ def _voices_for(model_id: str) -> dict:
             "names": {v: _display_voice(model_id, v) for v in raw}}
 
 
+def _median_f0(samples: np.ndarray, sr: int) -> float | None:
+    """Median fundamental frequency (Hz) of the voiced frames, or None when too
+    little voiced material. Cheap autocorrelation pitch tracker — only meant to
+    tell speakers apart (a gender flip is ~2x), not to be studio-accurate."""
+    win, hop = int(0.04 * sr), int(0.02 * sr)
+    if samples.size < win * 3:
+        return None
+    f0s: list[float] = []
+    lo, hi = int(sr / 350), int(sr / 60)
+    for i in range(0, samples.size - win, hop):
+        fr = samples[i:i + win]
+        if float(np.sqrt((fr ** 2).mean())) < 0.008:
+            continue
+        fr = fr - fr.mean()
+        ac = np.correlate(fr, fr, "full")[win - 1:]
+        if hi >= ac.size:
+            continue
+        pk = lo + int(np.argmax(ac[lo:hi]))
+        if ac[pk] > 0.25 * ac[0]:
+            f0s.append(sr / pk)
+    if len(f0s) < 8:
+        return None
+    return float(np.median(np.asarray(f0s)))
+
+
+_REF_F0_CACHE: dict[str, float | None] = {}
+
+
+def _ref_f0(path: str) -> float | None:
+    """Median f0 of a reference clip (cached per path)."""
+    if path not in _REF_F0_CACHE:
+        try:
+            from mlx_audio.utils import load_audio
+            arr = np.asarray(load_audio(path, sample_rate=24000), dtype=np.float32)
+            _REF_F0_CACHE[path] = _median_f0(arr, 24000)
+        except Exception as e:  # noqa: BLE001 - guard is best-effort
+            print(f"[speech] pitch guard: cannot read reference {path}: {e}")
+            _REF_F0_CACHE[path] = None
+    return _REF_F0_CACHE[path]
+
+
+# The sampler is seeded per attempt, so drifts are reproducible; when an attempt
+# lands far from the reference pitch (a cloned voice coming out as a different
+# speaker — the worst case is a gender flip, ~2x off), re-sample on a different
+# deterministic seed and keep the attempt closest to the reference.
+_PITCH_GUARD_RATIO = 1.35
+_PITCH_GUARD_ATTEMPTS = 3
+
+
 def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     st = get_status()
     model = _state.get("model")
@@ -704,6 +753,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
 
     req.voice = _resolve_voice_name(MODEL_ID, req.voice)
     ref_audio = resolve_voice(req.voice)
+    guard_ref: str | None = None  # reference clip whose pitch the output must match
     lang = (req.language or "").strip().lower()
     lang_code = lang if lang and lang != "unknown" else "en"
     kwargs: dict = {"speed": req.speed}
@@ -731,6 +781,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 kwargs["ref_audio"] = load_audio(ref_audio, sample_rate=model.sample_rate)
                 kwargs["ref_text"] = ref_text
                 voice_label = req.voice
+                guard_ref = ref_audio
             else:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
@@ -741,6 +792,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 from mlx_audio.utils import load_audio
                 kwargs["ref_audio"] = load_audio(anchor[0], sample_rate=model.sample_rate)
                 kwargs["ref_text"] = anchor[1]
+                guard_ref = anchor[0]
     elif IS_ORPHEUS:
         # Orpheus: named voices (tara, leah, ...), no lang_code. Cloning is
         # optional via a reference clip + its transcript; otherwise pick a named
@@ -754,6 +806,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 kwargs["ref_audio"] = ref_audio
                 kwargs["ref_text"] = ref_text
                 voice_label = req.voice
+                guard_ref = ref_audio
             else:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
@@ -771,6 +824,7 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 kwargs["ref_audio"] = load_audio(ref_audio, sample_rate=model.sample_rate)
                 kwargs["ref_text"] = ref_text
                 voice_label = req.voice
+                guard_ref = ref_audio
             else:
                 print(f"[speech] note: no transcript for '{req.voice}'; add "
                       f"voices/{req.voice}.txt or send ref_text to clone. "
@@ -781,11 +835,13 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
                 from mlx_audio.utils import load_audio
                 kwargs["ref_audio"] = load_audio(anchor[0], sample_rate=model.sample_rate)
                 kwargs["ref_text"] = anchor[1]
+                guard_ref = anchor[0]
     else:
         kwargs["lang_code"] = lang_code
         voice_label = req.voice if ref_audio else "default"
         if ref_audio:
             kwargs["ref_audio"] = ref_audio
+            guard_ref = ref_audio
         if req.exaggeration is not None:
             kwargs["exaggeration"] = req.exaggeration
         if req.cfg_weight is not None:
@@ -803,28 +859,60 @@ def synthesize(req: SpeechRequest) -> tuple[bytes, str, float]:
     # Pin the RNG so a voice is reproducible across requests. Every model's sampler is
     # stochastic (except deterministic Kokoro) and otherwise picks a different voice
     # each call, so they default to a fixed seed unless the request asks otherwise.
+    # The seed fixes the RNG STREAM, not the voice: the stream's consumption depends
+    # on the text, so rare texts still land on a drifted speaker (up to a gender
+    # flip) — and deterministically so. The pitch guard below catches those and
+    # re-samples on a different deterministic seed.
     seed = req.seed if req.seed is not None else _DEFAULT_SEED
-    if seed is not None:
-        import mlx.core as mx
-        mx.random.seed(int(seed))
 
-    gen_start = time.perf_counter()
+    def _generate_once(attempt_seed: int | None) -> tuple[list[np.ndarray], int, float]:
+        if attempt_seed is not None:
+            import mlx.core as mx
+            mx.random.seed(int(attempt_seed))
+        start = time.perf_counter()
+        out: list[np.ndarray] = []
+        chunk_sr = 24000
+        for result in model.generate(text=req.input, verbose=False, **kwargs):
+            chunk_sr = result.sample_rate or chunk_sr
+            audio_chunk = np.asarray(result.audio, dtype=np.float32)
+            # Denoise before trimming: the ambient floor otherwise reads as "loud"
+            # and defeats the silence detector, so the gaps wouldn't shrink.
+            if do_denoise:
+                audio_chunk = _denoise(audio_chunk, chunk_sr, req.denoise_amount)
+            if do_trim:
+                audio_chunk = _trim_silence(audio_chunk, chunk_sr)
+            if audio_chunk.size:
+                out.append(audio_chunk)
+        return out, chunk_sr, time.perf_counter() - start
+
+    ref_f0 = _ref_f0(guard_ref) if (guard_ref and not IS_KOKORO) else None
+    gen_secs = 0.0
+    best: tuple[float, list[np.ndarray], int] | None = None  # (f0 distance, chunks, sr)
     chunks: list[np.ndarray] = []
     sr = 24000
-    for result in model.generate(text=req.input, verbose=False, **kwargs):
-        sr = result.sample_rate or sr
-        audio_chunk = np.asarray(result.audio, dtype=np.float32)
-        # Denoise before trimming: the ambient floor otherwise reads as "loud" and
-        # defeats the silence detector, so the gaps wouldn't shrink.
-        if do_denoise:
-            audio_chunk = _denoise(audio_chunk, sr, req.denoise_amount)
-        if do_trim:
-            audio_chunk = _trim_silence(audio_chunk, sr)
-        if audio_chunk.size:
-            chunks.append(audio_chunk)
+    for attempt in range(_PITCH_GUARD_ATTEMPTS if ref_f0 else 1):
+        attempt_seed = None if seed is None else int(seed) + attempt * 7919
+        chunks, sr, secs = _generate_once(attempt_seed)
+        gen_secs += secs
+        if not ref_f0 or not chunks:
+            break
+        f0 = _median_f0(np.concatenate(chunks), sr)
+        if f0 is None:
+            break  # too little voiced material to judge; accept as-is
+        ratio = max(f0, ref_f0) / min(f0, ref_f0)
+        if ratio <= _PITCH_GUARD_RATIO:
+            best = None
+            break
+        print(f"[speech] pitch guard: attempt {attempt + 1} f0={f0:.0f}Hz vs "
+              f"reference {ref_f0:.0f}Hz (x{ratio:.2f}) — voice drifted, resampling")
+        if best is None or ratio < best[0]:
+            best = (ratio, chunks, sr)
+    if best is not None:  # every attempt drifted: keep the closest one
+        _, chunks, sr = best
+        print(f"[speech] pitch guard: all {_PITCH_GUARD_ATTEMPTS} attempts drifted; "
+              f"keeping the closest (x{best[0]:.2f})")
     if not chunks:
         raise HTTPException(500, "no audio produced")
-    gen_secs = time.perf_counter() - gen_start
 
     if do_trim and req.gap_ms > 0:
         gap = np.zeros(int(sr * req.gap_ms / 1000), dtype=np.float32)
